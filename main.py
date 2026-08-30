@@ -2,6 +2,8 @@ import os
 import sys
 import tkinter as tk
 import json
+import csv
+import shutil
 from tkinter import filedialog, messagebox, ttk
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -383,20 +385,34 @@ def edit_game():
     score_entry_edit.pack(anchor="w", ipady=6, ipadx=4)
     score_entry_edit.insert(0, str(current_score))
 
+    if current_frames:
+        # Score is derived from frame data for imported games — don't allow manual edits.
+        score_entry_edit.config(state="readonly", readonlybackground=ENTRY_BG)
+
     field_label(body, "CATEGORY")
     selected_category_var = tk.StringVar(value=current_category)
     style_dropdown(tk.OptionMenu(body, selected_category_var, *CATEGORIES)).pack(anchor="w")
 
     if current_frames:
-        warn = tk.Frame(body, bg="#FFFBEB", relief="flat")
-        warn.pack(fill=tk.X, pady=(14, 0))
-        tk.Label(warn, text="⚠  Changing the score won't update this game's saved frame details.",
-                 font=(FONT_BODY, 9), bg="#FFFBEB", fg="#92600A",
+        note = tk.Frame(body, bg="#EFF6FF", relief="flat")
+        note.pack(fill=tk.X, pady=(14, 0))
+        tk.Label(note, text="This game has frame-by-frame data. The score above is calculated "
+                             "from it — use \"Edit Frame-by-Frame\" below to correct a throw.",
+                 font=(FONT_BODY, 9), bg="#EFF6FF", fg=TEXT_MUTED,
                  wraplength=260, justify=tk.LEFT).pack(padx=10, pady=8)
+
+        def open_frame_editor():
+            show_frame_editor(game_id, on_saved=lambda new_score: (
+                score_entry_edit.config(state="normal"),
+                score_entry_edit.delete(0, tk.END),
+                score_entry_edit.insert(0, str(new_score)),
+                score_entry_edit.config(state="readonly"),
+            ))
+
+        make_button(body, "📋  Edit Frame-by-Frame", open_frame_editor).pack(anchor="w", pady=(10, 0))
 
     def save_edit():
         new_date_display = date_entry_edit.get()
-        new_score_text = score_entry_edit.get()
         if new_date_display == "":
             messagebox.showwarning("Missing Date", "Please enter a date.")
             return
@@ -404,14 +420,26 @@ def edit_game():
         if new_date is None:
             messagebox.showwarning("Invalid Date", "Please enter a valid date (MM/DD/YYYY).")
             return
-        try:
-            new_score = int(new_score_text)
-        except ValueError:
-            messagebox.showwarning("Invalid Score", "Score must be a number.")
-            return
-        if new_score < 0 or new_score > 300:
-            messagebox.showwarning("Invalid Score", "Bowling scores must be between 0 and 300.")
-            return
+
+        if current_frames:
+            # Score is read-only here; keep whatever is currently stored/just-recalculated.
+            try:
+                cursor.execute("SELECT score FROM games WHERE id = ?", (game_id,))
+                new_score = cursor.fetchone()[0]
+            except sqlite3.Error as error:
+                messagebox.showerror("Database Error", f"Could not read the current score:\n{error}")
+                return
+        else:
+            new_score_text = score_entry_edit.get()
+            try:
+                new_score = int(new_score_text)
+            except ValueError:
+                messagebox.showwarning("Invalid Score", "Score must be a number.")
+                return
+            if new_score < 0 or new_score > 300:
+                messagebox.showwarning("Invalid Score", "Bowling scores must be between 0 and 300.")
+                return
+
         try:
             cursor.execute(
                 "UPDATE games SET date = ?, score = ?, category = ? WHERE id = ?",
@@ -436,6 +464,59 @@ def edit_game():
 
 
 # ---------- FRAME DETAILS ----------
+
+def calculate_score_from_frames(frames):
+    """Compute a standard 10-pin bowling score from a list of frame dicts
+    (each with a 'throws' list of marks: 'X', '/', '-', or a digit string)."""
+    flat_pins = []
+    frame_start_index = []
+    for frame in frames:
+        frame_start_index.append(len(flat_pins))
+        pins_in_frame = []
+        for mark in frame.get("throws", []):
+            if mark == "X":
+                pins_in_frame.append(10)
+            elif mark == "-":
+                pins_in_frame.append(0)
+            elif mark == "/":
+                prev = pins_in_frame[-1] if pins_in_frame else 0
+                pins_in_frame.append(10 - prev)
+            else:
+                pins_in_frame.append(int(mark))
+        flat_pins.extend(pins_in_frame)
+
+    total = 0
+    for i in range(min(10, len(frames))):
+        start = frame_start_index[i]
+        throws = frames[i].get("throws", [])
+        if not throws:
+            continue
+        if i < 9:
+            first = flat_pins[start]
+            if first == 10:  # strike
+                total += 10 + sum(flat_pins[start + 1:start + 3])
+            elif len(throws) >= 2:
+                frame_sum = flat_pins[start] + flat_pins[start + 1]
+                if frame_sum == 10:  # spare
+                    bonus = flat_pins[start + 2] if len(flat_pins) > start + 2 else 0
+                    total += 10 + bonus
+                else:
+                    total += frame_sum
+            else:
+                total += flat_pins[start]
+        else:
+            # 10th frame: sum whatever throws were recorded (up to 3)
+            total += sum(flat_pins[start:start + 3])
+    return total
+
+
+def is_valid_throw_mark(mark):
+    """A throw mark must be 'X', '/', '-', or a single digit 0-9."""
+    mark = mark.strip()
+    if mark in ("X", "/", "-"):
+        return True
+    return mark.isdigit() and len(mark) == 1
+
 
 def frame_pin_left_values(frame_number, throws):
     remaining = 10
@@ -544,7 +625,154 @@ def show_frame_details():
     details_window.geometry(f"{max(w, 960)}x{h}")
 
 
+def show_frame_editor(game_id, on_saved=None):
+    """Let the user correct individual throw marks for a game and recalculate its score.
+    Throws can only be corrected, not added or removed, to keep frame structure intact."""
+    try:
+        cursor.execute("SELECT date, score, frames FROM games WHERE id = ?", (game_id,))
+        game_date, score, frame_data = cursor.fetchone()
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not load the game:\n{error}")
+        return
+
+    try:
+        frames = json.loads(frame_data)
+    except (TypeError, json.JSONDecodeError):
+        messagebox.showerror("Could Not Read Frames", "The saved frame details for this game are invalid.")
+        return
+
+    editor = tk.Toplevel(window)
+    editor.title("Edit Frame-by-Frame")
+    editor.configure(bg=OFFWHITE)
+    editor.resizable(False, False)
+    editor.transient(window)
+    editor.grab_set()
+
+    # Header
+    hdr = tk.Frame(editor, bg=NAVY)
+    hdr.pack(fill=tk.X)
+    tk.Label(hdr, text="Edit Frame-by-Frame", font=(FONT_BODY, 15, "bold"),
+             bg=NAVY, fg=WHITE).pack(side=tk.LEFT, padx=20, pady=14)
+    tk.Label(hdr, text=f"{to_display_date(game_date)}",
+             font=(FONT_BODY, 12), bg=NAVY, fg=AMBER).pack(side=tk.LEFT, pady=14)
+
+    tk.Label(editor,
+             text="Edit a throw mark (X, /, -, or a digit 0-9), then recalculate.\n"
+                  "Throws can't be added or removed here — only corrected.",
+             font=(FONT_BODY, 10), bg=OFFWHITE, fg=TEXT_MUTED,
+             justify=tk.LEFT).pack(pady=(14, 8), padx=18, anchor="w")
+
+    scorecard = tk.Frame(editor, bg=OFFWHITE)
+    scorecard.pack(fill=tk.X, padx=18, pady=(0, 8))
+
+    throw_entries = []  # list of (frame_index, throw_index, entry_widget)
+
+    for frame_number, frame in enumerate(frames, start=1):
+        is_last = frame_number == 10
+        frame_box = tk.Frame(scorecard, bg=CARD_BG,
+                             highlightthickness=1, highlightbackground=BORDER,
+                             width=90 if not is_last else 130)
+        frame_box.grid(row=0, column=frame_number - 1, padx=2, sticky="nsew")
+        frame_box.grid_propagate(False)
+        scorecard.grid_columnconfigure(frame_number - 1, weight=1)
+
+        num_bar = tk.Frame(frame_box, bg=NAVY_MID)
+        num_bar.pack(fill=tk.X)
+        tk.Label(num_bar, text=f"{frame_number}", font=(FONT_BODY, 9, "bold"),
+                 bg=NAVY_MID, fg=AMBER).pack(pady=4)
+
+        throws_row = tk.Frame(frame_box, bg=CARD_BG)
+        throws_row.pack(pady=10)
+
+        throws = frame.get("throws", [])
+        for throw_index, mark in enumerate(throws):
+            e = tk.Entry(throws_row, font=(FONT_MONO, 14, "bold"), width=2,
+                         justify="center", bg=ENTRY_BG, relief="flat",
+                         highlightthickness=1, highlightbackground=BORDER,
+                         highlightcolor=AMBER)
+            e.pack(side=tk.LEFT, padx=2)
+            e.insert(0, mark)
+            throw_entries.append((frame_number - 1, throw_index, e))
+
+    def recalculate_and_save():
+        # Read edited marks back into the frames structure
+        updated_frames = [dict(f) for f in frames]
+        for frame_index, throw_index, entry in throw_entries:
+            mark = entry.get().strip().upper()
+            if not is_valid_throw_mark(mark):
+                messagebox.showwarning(
+                    "Invalid Throw",
+                    f"Frame {frame_index + 1}: '{mark}' isn't valid. "
+                    "Use X, /, -, or a single digit 0-9.",
+                    parent=editor,
+                )
+                return
+            updated_frames[frame_index]["throws"][throw_index] = mark
+
+        try:
+            new_score = calculate_score_from_frames(updated_frames)
+        except (ValueError, IndexError):
+            messagebox.showerror(
+                "Could Not Calculate Score",
+                "Those throw marks don't add up to a valid frame (e.g. a '/' with no prior throw, "
+                "or pins exceeding 10 in a frame). Please check them and try again.",
+                parent=editor,
+            )
+            return
+
+        if new_score < 0 or new_score > 300:
+            messagebox.showwarning("Invalid Score", "That would produce a score outside 0–300. "
+                                                     "Please check the marks.", parent=editor)
+            return
+
+        try:
+            cursor.execute(
+                "UPDATE games SET score = ?, frames = ? WHERE id = ?",
+                (new_score, json.dumps(updated_frames), game_id)
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            messagebox.showerror("Database Error", f"Could not save changes:\n{error}", parent=editor)
+            return
+
+        editor.destroy()
+        if on_saved:
+            on_saved(new_score)
+        update_history_display()
+        messagebox.showinfo("Saved", f"Frame details updated. New score: {new_score}")
+
+    btn_row = tk.Frame(editor, bg=OFFWHITE)
+    btn_row.pack(pady=(8, 18))
+    make_button(btn_row, "Recalculate & Save", recalculate_and_save, primary=True).pack(side=tk.LEFT, padx=(0, 8))
+    make_button(btn_row, "Cancel", editor.destroy).pack(side=tk.LEFT)
+
+    editor.update_idletasks()
+    w = editor.winfo_reqwidth()
+    h = editor.winfo_reqheight()
+    editor.geometry(f"{max(w, 960)}x{h}")
+
+
 # ---------- IMPORT SCORESHEET ----------
+
+def find_duplicate_flags(player_records):
+    """Return a list of booleans (same length/order as player_records) marking which
+    records already exist in the DB, matched on date + score + center."""
+    try:
+        cursor.execute("SELECT date, score, center FROM games")
+        existing = set()
+        for row_date, row_score, row_center in cursor.fetchall():
+            existing.add((row_date, row_score, row_center or None))
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not check for duplicates:\n{error}")
+        return [False] * len(player_records)
+
+    flags = []
+    for record in player_records:
+        iso_date = to_iso_date(record["date"]) or record["date"]
+        key = (iso_date, record["score"], record.get("center") or None)
+        flags.append(key in existing)
+    return flags
+
 
 def show_import_review(player, player_records, file_name):
     review_window = tk.Toplevel(window)
@@ -577,15 +805,33 @@ def show_import_review(player, player_records, file_name):
              bg="#EFF6FF", fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, padx=14, pady=(0, 10))
 
     # Game list
+    duplicate_flags = find_duplicate_flags(player_records)
+    duplicate_count = sum(duplicate_flags)
+
     list_frame = tk.Frame(body, bg=BORDER, highlightthickness=0)
     list_frame.pack(fill=tk.X)
 
-    preview = tk.Listbox(list_frame, font=(FONT_MONO, 12), width=48, height=10,
+    preview = tk.Listbox(list_frame, font=(FONT_MONO, 12), width=54, height=10,
                          bg=CARD_BG, fg=TEXT, selectbackground=NAVY, selectforeground=AMBER,
                          relief="flat", borderwidth=0, highlightthickness=0)
     preview.pack(padx=1, pady=1)
-    for game_number, record in enumerate(player_records, start=1):
-        preview.insert(tk.END, f"  Game {game_number:<3}  {record['date']:<14}  {record['score']}")
+    for game_number, (record, is_dup) in enumerate(zip(player_records, duplicate_flags), start=1):
+        marker = "  ⚠ already in tracker" if is_dup else ""
+        preview.insert(tk.END, f"  Game {game_number:<3}  {record['date']:<14}  {record['score']:<5}{marker}")
+        if is_dup:
+            preview.itemconfig(game_number - 1, fg="#B45309")
+
+    if duplicate_count:
+        dup_note = tk.Frame(body, bg="#FFFBEB", relief="flat")
+        dup_note.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(
+            dup_note,
+            text=f"⚠  {duplicate_count} of {len(player_records)} game(s) in this file look like "
+                 "they're already in the tracker (same date, score, and center). "
+                 "You can skip those or import everything anyway.",
+            font=(FONT_BODY, 9), bg="#FFFBEB", fg="#92600A",
+            wraplength=440, justify=tk.LEFT,
+        ).pack(padx=10, pady=8)
 
     # Category
     cat_row = tk.Frame(body, bg=OFFWHITE)
@@ -598,10 +844,9 @@ def show_import_review(player, player_records, file_name):
     tk.Label(body, text="Applied to every game in this file.",
              font=(FONT_BODY, 9), bg=OFFWHITE, fg=TEXT_MUTED).pack(pady=(4, 0))
 
-    def confirm_import():
-        if not messagebox.askyesno("Import Games",
-                                   f"Import {len(player_records)} game(s) for {player}?",
-                                   parent=review_window):
+    def do_import(records_to_import):
+        if not records_to_import:
+            messagebox.showinfo("Nothing to Import", "No games left to import.", parent=review_window)
             return
         chosen_category = import_category_var.get()
         try:
@@ -610,7 +855,7 @@ def show_import_review(player, player_records, file_name):
                 [
                     (to_iso_date(record["date"]) or record["date"], record["score"], chosen_category,
                      record.get("center") or None, json.dumps(record["frames"]))
-                    for record in player_records
+                    for record in records_to_import
                 ],
             )
             connection.commit()
@@ -620,11 +865,36 @@ def show_import_review(player, player_records, file_name):
         review_window.destroy()
         refresh_center_filter_options()
         update_history_display()
-        messagebox.showinfo("Import Complete", f"Imported {len(player_records)} game(s) for {player}.")
+        messagebox.showinfo("Import Complete", f"Imported {len(records_to_import)} game(s) for {player}.")
+
+    def confirm_import_all():
+        if not messagebox.askyesno("Import Games",
+                                   f"Import {len(player_records)} game(s) for {player}?",
+                                   parent=review_window):
+            return
+        do_import(player_records)
+
+    def confirm_import_skip_duplicates():
+        records_to_import = [r for r, is_dup in zip(player_records, duplicate_flags) if not is_dup]
+        if not messagebox.askyesno(
+            "Import Games",
+            f"Import {len(records_to_import)} game(s) for {player}, "
+            f"skipping {duplicate_count} likely duplicate(s)?",
+            parent=review_window,
+        ):
+            return
+        do_import(records_to_import)
 
     actions = tk.Frame(body, bg=OFFWHITE)
     actions.pack(pady=18)
-    make_button(actions, f"Import {len(player_records)} Game(s)", confirm_import, primary=True).pack(side=tk.LEFT, padx=(0, 8))
+    if duplicate_count:
+        make_button(actions, f"Skip Duplicates & Import {len(player_records) - duplicate_count}",
+                    confirm_import_skip_duplicates, primary=True).pack(side=tk.LEFT, padx=(0, 8))
+        make_button(actions, f"Import All {len(player_records)} Anyway",
+                    confirm_import_all).pack(side=tk.LEFT, padx=(0, 8))
+    else:
+        make_button(actions, f"Import {len(player_records)} Game(s)",
+                    confirm_import_all, primary=True).pack(side=tk.LEFT, padx=(0, 8))
     make_button(actions, "Cancel", review_window.destroy).pack(side=tk.LEFT)
 
     review_window.update_idletasks()
@@ -707,9 +977,20 @@ def import_scoresheet():
 
 # ---------- INSIGHTS WINDOW ----------
 
+def categorize_frame(throws):
+    """Classify a single frame as 'strike', 'spare', or 'open' based on its throw marks."""
+    if not throws:
+        return None
+    if throws[0] == "X":
+        return "strike"
+    if len(throws) >= 2 and throws[1] == "/":
+        return "spare"
+    return "open"
+
+
 def show_insights():
     try:
-        cursor.execute("SELECT date, score, category FROM games ORDER BY date")
+        cursor.execute("SELECT date, score, category, frames FROM games ORDER BY date")
         all_rows = cursor.fetchall()
     except sqlite3.Error as error:
         messagebox.showerror("Database Error", f"Could not load games:\n{error}")
@@ -721,17 +1002,41 @@ def show_insights():
 
     # ── Parse all rows ──────────────────────────────────────────────────────
     parsed_games = []
-    for game_date, score, category in all_rows:
+    for game_date, score, category, frame_data in all_rows:
         d = parse_date_flexible(game_date)
         parsed_games.append({
             "date": d,
             "date_str": to_display_date(game_date),
             "score": score,
             "category": category or "Uncategorized",
+            "frame_data": frame_data,
         })
 
     all_scores = [g["score"] for g in parsed_games]
     overall_avg = sum(all_scores) / len(all_scores)
+
+    # ── Strike / spare / open frame percentages (games with frame data only) ─
+    strike_count = 0
+    spare_count = 0
+    open_count = 0
+    games_with_frames = 0
+    for g in parsed_games:
+        if not g["frame_data"]:
+            continue
+        try:
+            frames = json.loads(g["frame_data"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        games_with_frames += 1
+        for frame in frames[:10]:
+            outcome = categorize_frame(frame.get("throws", []))
+            if outcome == "strike":
+                strike_count += 1
+            elif outcome == "spare":
+                spare_count += 1
+            elif outcome == "open":
+                open_count += 1
+    total_frames_counted = strike_count + spare_count + open_count
 
     # ── Streak tracking ─────────────────────────────────────────────────────
     # Current above-average streak and longest ever
@@ -830,6 +1135,34 @@ def show_insights():
         tk.Label(card, text=f"avg {cat_avg:.1f}  ·  {len(data['scores'])} games",
                  font=(FONT_BODY, 9), bg=CARD_BG, fg=TEXT_MUTED).pack(anchor="w")
 
+    # ── SECTION: Strike / spare / open percentages ────────────────────────────
+    if games_with_frames > 0 and total_frames_counted > 0:
+        section_label(body, "STRIKE & SPARE PERCENTAGE  "
+                             f"(from {games_with_frames} imported game(s) with frame data)")
+
+        pct_row = tk.Frame(body, bg=OFFWHITE)
+        pct_row.pack(fill=tk.X)
+
+        def pct_card(parent, label, count, total, color):
+            pct = (count / total * 100) if total else 0
+            card = tk.Frame(parent, bg=CARD_BG,
+                            highlightthickness=1, highlightbackground=BORDER,
+                            padx=22, pady=14)
+            card.pack(side=tk.LEFT, padx=(0, 12))
+            tk.Label(card, text=f"{pct:.0f}%",
+                     font=(FONT_BODY, 30, "bold"), bg=CARD_BG, fg=color).pack()
+            tk.Label(card, text=label, font=(FONT_BODY, 9, "bold"),
+                     bg=CARD_BG, fg=TEXT_MUTED).pack()
+            tk.Label(card, text=f"{count} of {total} frames",
+                     font=(FONT_BODY, 8), bg=CARD_BG, fg=TEXT_MUTED).pack()
+
+        pct_card(pct_row, "STRIKE RATE", strike_count, total_frames_counted, AMBER)
+        # Spare rate is conventionally measured against spare *opportunities*
+        # (frames where the first ball didn't strike), not all frames.
+        spare_opportunities = spare_count + open_count
+        pct_card(pct_row, "SPARE CONVERSION", spare_count, spare_opportunities, GREEN)
+        pct_card(pct_row, "OPEN FRAMES", open_count, total_frames_counted, RED)
+
     # ── SECTION: Score trend chart ────────────────────────────────────────────
     section_label(body, "SCORE TREND  (all games, chronological)")
 
@@ -923,6 +1256,63 @@ def show_insights():
     w = ins.winfo_reqwidth()
     h = ins.winfo_reqheight()
     ins.geometry(f"{max(w, 760)}x{min(h, 860)}")
+
+
+# ---------- EXPORT / BACKUP ----------
+
+def export_to_csv():
+    file_path = filedialog.asksaveasfilename(
+        title="Export Game History",
+        defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        initialfile="bowling_history.csv",
+    )
+    if not file_path:
+        return
+
+    try:
+        cursor.execute("SELECT date, score, category, center FROM games ORDER BY date")
+        rows = cursor.fetchall()
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not load games:\n{error}")
+        return
+
+    if not rows:
+        messagebox.showinfo("Nothing to Export", "There are no games in the tracker yet.")
+        return
+
+    try:
+        with open(file_path, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["Date", "Score", "Category", "Center"])
+            for game_date, score, category, center in rows:
+                writer.writerow([to_display_date(game_date), score, category or "", center or ""])
+    except OSError as error:
+        messagebox.showerror("Export Failed", f"Could not write the CSV file:\n{error}")
+        return
+
+    messagebox.showinfo("Export Complete", f"Exported {len(rows)} game(s) to:\n{file_path}")
+
+
+def backup_database():
+    default_name = f"bowling_backup_{date.today().isoformat()}.db"
+    file_path = filedialog.asksaveasfilename(
+        title="Backup Database",
+        defaultextension=".db",
+        filetypes=[("SQLite Database", "*.db"), ("All files", "*.*")],
+        initialfile=default_name,
+    )
+    if not file_path:
+        return
+
+    try:
+        connection.commit()  # make sure everything on disk is current before copying
+        shutil.copy2(os.path.join(APP_FOLDER, "bowling.db"), file_path)
+    except OSError as error:
+        messagebox.showerror("Backup Failed", f"Could not copy the database file:\n{error}")
+        return
+
+    messagebox.showinfo("Backup Complete", f"Database backed up to:\n{file_path}")
 
 
 # ---------- SHUTDOWN ----------
@@ -1214,6 +1604,8 @@ action_bar.pack(fill=tk.X, padx=20, pady=(10, 16))
 make_button(action_bar, "✏  Edit Game", edit_game).pack(side=tk.LEFT, padx=(0, 8))
 make_button(action_bar, "📋  Frame Details", show_frame_details).pack(side=tk.LEFT, padx=(0, 8))
 make_button(action_bar, "🗑  Delete Game", delete_game, danger=True).pack(side=tk.LEFT, padx=(0, 8))
+make_button(action_bar, "⬇  Export CSV", export_to_csv).pack(side=tk.LEFT, padx=(0, 8))
+make_button(action_bar, "💾  Backup DB", backup_database).pack(side=tk.LEFT, padx=(0, 8))
 make_button(action_bar, "📊  Insights", show_insights, primary=True).pack(side=tk.RIGHT)
 
 
