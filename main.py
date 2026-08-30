@@ -96,7 +96,7 @@ def update_stats():
     low_value.config(text=str(low))
 
 
-# ---------- LOAD / FILTER GAMES ----------
+# ---------- DATE HANDLING ----------
 
 def parse_date_flexible(date_str):
     """Try common date formats and return a date object, or None on failure."""
@@ -107,6 +107,36 @@ def parse_date_flexible(date_str):
             continue
     return None
 
+
+def to_iso_date(display_date_str):
+    """Convert a flexible-format date string to YYYY-MM-DD for storage. Returns None on failure."""
+    parsed = parse_date_flexible(display_date_str)
+    return parsed.isoformat() if parsed else None
+
+
+def to_display_date(iso_date_str):
+    """Convert a YYYY-MM-DD string to MM/DD/YYYY for display. Returns the original string on failure."""
+    try:
+        return datetime.strptime(iso_date_str.strip(), "%Y-%m-%d").strftime("%m/%d/%Y")
+    except (ValueError, AttributeError):
+        return iso_date_str
+
+
+def migrate_dates_to_iso():
+    """One-time normalization pass: rewrite any existing dates to YYYY-MM-DD so they sort correctly."""
+    cursor.execute("SELECT id, date FROM games")
+    rows = cursor.fetchall()
+    for row_id, row_date in rows:
+        iso = to_iso_date(row_date)
+        if iso and iso != row_date:
+            cursor.execute("UPDATE games SET date = ? WHERE id = ?", (iso, row_id))
+
+
+migrate_dates_to_iso()
+connection.commit()
+
+
+# ---------- LOAD / FILTER GAMES ----------
 
 def get_date_range_from_quick_pick(pick):
     """Return (date_from, date_to) strings for a quick-pick label, or (None, None)."""
@@ -177,7 +207,7 @@ def update_history_display():
     query = "SELECT id, date, score, category FROM games"
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY id"
+    query += " ORDER BY date"
 
     try:
         cursor.execute(query, params)
@@ -192,7 +222,8 @@ def update_history_display():
 
     display_i = 0
     for (game_id, game_date, score, category) in rows:
-        # Apply date range filter in Python (dates stored in mixed formats)
+        # Apply date range filter in Python (dates are stored as ISO but this still works
+        # since parse_date_flexible understands YYYY-MM-DD too)
         if date_from or date_to:
             parsed = parse_date_flexible(game_date)
             if parsed is None:
@@ -204,7 +235,7 @@ def update_history_display():
 
         scores.append(score)
         displayed_ids.append(game_id)
-        history.insert(tk.END, f"  {game_date:<22} {score:>3}   {category}")
+        history.insert(tk.END, f"  {to_display_date(game_date):<22} {score:>3}   {category}")
         history.itemconfig(display_i, **{"bg": "#F8FAFC" if display_i % 2 == 0 else CARD_BG})
         display_i += 1
 
@@ -229,12 +260,18 @@ def refresh_center_filter_options():
 # ---------- ADD GAME ----------
 
 def add_game():
-    game_date = date_entry.get()
+    game_date_display = date_entry.get()
     score_text = score_entry.get()
 
-    if game_date == "":
+    if game_date_display == "":
         messagebox.showwarning("Missing Date", "Please enter a date.")
         return
+
+    game_date = to_iso_date(game_date_display)
+    if game_date is None:
+        messagebox.showwarning("Invalid Date", "Please enter a valid date (MM/DD/YYYY).")
+        return
+
     if score_text == "":
         messagebox.showwarning("Missing Score", "Please enter a score.")
         return
@@ -336,7 +373,7 @@ def edit_game():
                                 highlightthickness=1, highlightbackground=BORDER,
                                 highlightcolor=AMBER)
     date_entry_edit.pack(anchor="w", ipady=6, ipadx=4)
-    date_entry_edit.insert(0, current_date)
+    date_entry_edit.insert(0, to_display_date(current_date))
 
     field_label(body, "SCORE")
     score_entry_edit = tk.Entry(body, font=(FONT_BODY, 14), width=10,
@@ -358,10 +395,14 @@ def edit_game():
                  wraplength=260, justify=tk.LEFT).pack(padx=10, pady=8)
 
     def save_edit():
-        new_date = date_entry_edit.get()
+        new_date_display = date_entry_edit.get()
         new_score_text = score_entry_edit.get()
-        if new_date == "":
+        if new_date_display == "":
             messagebox.showwarning("Missing Date", "Please enter a date.")
+            return
+        new_date = to_iso_date(new_date_display)
+        if new_date is None:
+            messagebox.showwarning("Invalid Date", "Please enter a valid date (MM/DD/YYYY).")
             return
         try:
             new_score = int(new_score_text)
@@ -457,7 +498,7 @@ def show_frame_details():
     hdr.pack(fill=tk.X)
     tk.Label(hdr, text=f"Frame Details", font=(FONT_BODY, 15, "bold"),
              bg=NAVY, fg=WHITE).pack(side=tk.LEFT, padx=20, pady=14)
-    tk.Label(hdr, text=f"{game_date}  ·  {score} pts",
+    tk.Label(hdr, text=f"{to_display_date(game_date)}  ·  {score} pts",
              font=(FONT_BODY, 12), bg=NAVY, fg=AMBER).pack(side=tk.LEFT, pady=14)
 
     tk.Label(details_window,
@@ -567,7 +608,7 @@ def show_import_review(player, player_records, file_name):
             cursor.executemany(
                 "INSERT INTO games (date, score, category, center, frames) VALUES (?, ?, ?, ?, ?)",
                 [
-                    (record["date"], record["score"], chosen_category,
+                    (to_iso_date(record["date"]) or record["date"], record["score"], chosen_category,
                      record.get("center") or None, json.dumps(record["frames"]))
                     for record in player_records
                 ],
@@ -668,7 +709,7 @@ def import_scoresheet():
 
 def show_insights():
     try:
-        cursor.execute("SELECT date, score, category FROM games ORDER BY id")
+        cursor.execute("SELECT date, score, category FROM games ORDER BY date")
         all_rows = cursor.fetchall()
     except sqlite3.Error as error:
         messagebox.showerror("Database Error", f"Could not load games:\n{error}")
@@ -684,11 +725,10 @@ def show_insights():
         d = parse_date_flexible(game_date)
         parsed_games.append({
             "date": d,
-            "date_str": game_date,
+            "date_str": to_display_date(game_date),
             "score": score,
             "category": category or "Uncategorized",
         })
-    parsed_games.sort(key=lambda g: g["date"] or date.min)
 
     all_scores = [g["score"] for g in parsed_games]
     overall_avg = sum(all_scores) / len(all_scores)
