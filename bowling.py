@@ -9,6 +9,7 @@ import sqlite3
 from datetime import date, datetime, timedelta
 import calendar
 from scoresheet_importer import read_scoresheet
+from arsenal import show_arsenal, _ensure_balls_table
 
 
 # ---------- CONSTANTS ----------
@@ -43,8 +44,11 @@ try:
         cursor.execute("ALTER TABLE games ADD COLUMN frames TEXT")
     if "center" not in existing_columns:
         cursor.execute("ALTER TABLE games ADD COLUMN center TEXT")
+    if "ball" not in existing_columns:
+        cursor.execute("ALTER TABLE games ADD COLUMN ball TEXT")
 
     connection.commit()
+    _ensure_balls_table(cursor, connection)
 except sqlite3.Error as error:
     messagebox.showerror("Database Error", f"Could not open the database:\n{error}")
     sys.exit(1)
@@ -54,17 +58,18 @@ except sqlite3.Error as error:
 
 scores = []
 displayed_ids = []
+sort_column = "date"   # one of: "date", "score", "category"
+sort_ascending = True
 
 
 # ---------- DESIGN TOKENS ----------
 
-# Scoreboard-inspired palette: deep navy base, amber accent (lane wood + pin gloss)
-NAVY        = "#0F1F36"   # scoreboard background
-NAVY_MID    = "#1A3352"   # slightly lighter navy for card accents
-AMBER       = "#F59E0B"   # gold accent — like pin gloss / trophy
-AMBER_DIM   = "#92600A"   # muted amber for secondary text on dark bg
+NAVY        = "#0F1F36"
+NAVY_MID    = "#1A3352"
+AMBER       = "#F59E0B"
+AMBER_DIM   = "#92600A"
 WHITE       = "#FFFFFF"
-OFFWHITE    = "#F8FAFC"   # page background
+OFFWHITE    = "#F8FAFC"
 CARD_BG     = "#FFFFFF"
 BORDER      = "#E2EAF3"
 TEXT        = "#0F1F36"
@@ -76,8 +81,33 @@ ENTRY_BG    = "#F1F5FB"
 FONT_BODY   = "Helvetica"
 FONT_MONO   = "Courier"
 
+SPACE_XS = 4
+SPACE_SM = 8
+SPACE_MD = 16
+SPACE_LG = 24
+
+DESIGN_TOKENS = {
+    "NAVY": NAVY, "NAVY_MID": NAVY_MID, "AMBER": AMBER,
+    "WHITE": WHITE, "OFFWHITE": OFFWHITE, "CARD_BG": CARD_BG,
+    "BORDER": BORDER, "TEXT": TEXT, "TEXT_MUTED": TEXT_MUTED,
+    "RED": RED, "GREEN": GREEN, "ENTRY_BG": ENTRY_BG,
+    "FONT_BODY": FONT_BODY, "FONT_MONO": FONT_MONO,
+}
+
 
 # ---------- STATISTICS ----------
+
+NO_BALL_LABEL = "— No Ball —"
+
+
+def get_arsenal_ball_names():
+    """Ball names from the Arsenal (balls table), alphabetical."""
+    try:
+        cursor.execute("SELECT name FROM balls ORDER BY name")
+        return [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error:
+        return []
+
 
 def update_stats():
     if len(scores) == 0:
@@ -101,7 +131,6 @@ def update_stats():
 # ---------- DATE HANDLING ----------
 
 def parse_date_flexible(date_str):
-    """Try common date formats and return a date object, or None on failure."""
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(date_str.strip(), fmt).date()
@@ -111,13 +140,11 @@ def parse_date_flexible(date_str):
 
 
 def to_iso_date(display_date_str):
-    """Convert a flexible-format date string to YYYY-MM-DD for storage. Returns None on failure."""
     parsed = parse_date_flexible(display_date_str)
     return parsed.isoformat() if parsed else None
 
 
 def to_display_date(iso_date_str):
-    """Convert a YYYY-MM-DD string to MM/DD/YYYY for display. Returns the original string on failure."""
     try:
         return datetime.strptime(iso_date_str.strip(), "%Y-%m-%d").strftime("%m/%d/%Y")
     except (ValueError, AttributeError):
@@ -125,7 +152,6 @@ def to_display_date(iso_date_str):
 
 
 def migrate_dates_to_iso():
-    """One-time normalization pass: rewrite any existing dates to YYYY-MM-DD so they sort correctly."""
     cursor.execute("SELECT id, date FROM games")
     rows = cursor.fetchall()
     for row_id, row_date in rows:
@@ -141,7 +167,6 @@ connection.commit()
 # ---------- LOAD / FILTER GAMES ----------
 
 def get_date_range_from_quick_pick(pick):
-    """Return (date_from, date_to) strings for a quick-pick label, or (None, None)."""
     today = date.today()
     if pick == "All Time":
         return None, None
@@ -159,7 +184,6 @@ def get_date_range_from_quick_pick(pick):
         y = today.year - 1
         return f"01/01/{y}", f"12/31/{y}"
     else:
-        # Month names: "January", "February", …
         for month_num, month_name in enumerate(
             ["January","February","March","April","May","June",
              "July","August","September","October","November","December"], start=1
@@ -172,8 +196,10 @@ def get_date_range_from_quick_pick(pick):
 
 
 def apply_quick_pick(*args):
-    """When the quick-pick dropdown changes, populate the From/To fields and refresh."""
     pick = time_quick_var.get()
+    if pick == "Custom":
+        update_history_display()
+        return
     d_from, d_to = get_date_range_from_quick_pick(pick)
     date_from_entry.delete(0, tk.END)
     date_to_entry.delete(0, tk.END)
@@ -187,6 +213,7 @@ def apply_quick_pick(*args):
 def update_history_display():
     selected_category = category_filter_var.get()
     selected_center = center_filter_var.get()
+    selected_ball = ball_filter_var.get()
     try:
         date_from_str = date_from_entry.get().strip()
         date_to_str   = date_to_entry.get().strip()
@@ -205,11 +232,16 @@ def update_history_display():
     if selected_center != "All":
         conditions.append("center = ?")
         params.append(selected_center)
+    if selected_ball != "All":
+        conditions.append("ball = ?")
+        params.append(selected_ball)
 
-    query = "SELECT id, date, score, category FROM games"
+    query = "SELECT id, date, score, category, ball FROM games"
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY date"
+    sql_column = {"date": "date", "score": "score", "category": "category", "ball": "ball"}[sort_column]
+    direction = "ASC" if sort_ascending else "DESC"
+    query += f" ORDER BY {sql_column} {direction}"
 
     try:
         cursor.execute(query, params)
@@ -223,9 +255,7 @@ def update_history_display():
     displayed_ids.clear()
 
     display_i = 0
-    for (game_id, game_date, score, category) in rows:
-        # Apply date range filter in Python (dates are stored as ISO but this still works
-        # since parse_date_flexible understands YYYY-MM-DD too)
+    for (game_id, game_date, score, category, ball) in rows:
         if date_from or date_to:
             parsed = parse_date_flexible(game_date)
             if parsed is None:
@@ -237,11 +267,26 @@ def update_history_display():
 
         scores.append(score)
         displayed_ids.append(game_id)
-        history.insert(tk.END, f"  {to_display_date(game_date):<22} {score:>3}   {category}")
+        history.insert(tk.END, f"  {to_display_date(game_date):<22} {score:>3}   {category or '':<16} {ball or ''}")
         history.itemconfig(display_i, **{"bg": "#F8FAFC" if display_i % 2 == 0 else CARD_BG})
         display_i += 1
 
     update_stats()
+
+
+def refresh_ball_filter_options():
+    try:
+        cursor.execute(
+            "SELECT DISTINCT ball FROM games WHERE ball IS NOT NULL AND ball != '' ORDER BY ball"
+        )
+        balls = [row[0] for row in cursor.fetchall()]
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not load balls:\n{error}")
+        balls = []
+
+    ball_filter_menu["values"] = ["All"] + balls
+    if ball_filter_var.get() not in ball_filter_menu["values"]:
+        ball_filter_var.set("All")
 
 
 def refresh_center_filter_options():
@@ -289,11 +334,14 @@ def add_game():
         return
 
     category = new_game_category_var.get()
+    ball = ball_var.get()
+    if ball == NO_BALL_LABEL:
+        ball = ""
 
     try:
         cursor.execute(
-            "INSERT INTO games (date, score, category) VALUES (?, ?, ?)",
-            (game_date, score, category)
+            "INSERT INTO games (date, score, category, ball) VALUES (?, ?, ?, ?)",
+            (game_date, score, category, ball or None)
         )
         connection.commit()
     except sqlite3.Error as error:
@@ -301,6 +349,7 @@ def add_game():
         return
 
     score_entry.delete(0, tk.END)
+    refresh_ball_filter_options()
     update_history_display()
 
 
@@ -312,9 +361,49 @@ def delete_game():
         messagebox.showwarning("No Game Selected", "Please select a game to delete.")
         return
 
+    if len(selected) > 1:
+        game_ids = [displayed_ids[i] for i in selected]
+        confirm = messagebox.askyesno(
+            "Delete Games",
+            f"Delete these {len(game_ids)} games?\n\nThis can't be undone.",
+        )
+        if not confirm:
+            return
+        try:
+            cursor.executemany(
+                "DELETE FROM games WHERE id = ?", [(gid,) for gid in game_ids]
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            messagebox.showerror("Database Error", f"Could not delete the games:\n{error}")
+            return
+        update_history_display()
+        return
+
     index = selected[0]
     game_id = displayed_ids[index]
-    confirm = messagebox.askyesno("Delete Game", "Are you sure you want to delete this game?")
+
+    try:
+        cursor.execute("SELECT date, score, category FROM games WHERE id = ?", (game_id,))
+        row = cursor.fetchone()
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not load the game:\n{error}")
+        return
+
+    if row is None:
+        messagebox.showwarning("Game Not Found", "That game no longer exists.")
+        update_history_display()
+        return
+
+    game_date, score, category = row
+    confirm = messagebox.askyesno(
+        "Delete Game",
+        f"Delete this game?\n\n"
+        f"Date:      {to_display_date(game_date)}\n"
+        f"Score:     {score}\n"
+        f"Category:  {category or 'Uncategorized'}\n\n"
+        f"This can't be undone.",
+    )
     if not confirm:
         return
 
@@ -336,15 +425,20 @@ def edit_game():
         messagebox.showwarning("No Game Selected", "Please select a game to edit.")
         return
 
+    if len(selected) > 1:
+        game_ids = [displayed_ids[i] for i in selected]
+        batch_edit_games(game_ids)
+        return
+
     index = selected[0]
     game_id = displayed_ids[index]
 
     try:
         cursor.execute(
-            "SELECT date, score, category, frames FROM games WHERE id = ?",
+            "SELECT date, score, category, frames, ball FROM games WHERE id = ?",
             (game_id,)
         )
-        current_date, current_score, current_category, current_frames = cursor.fetchone()
+        current_date, current_score, current_category, current_frames, current_ball = cursor.fetchone()
     except sqlite3.Error as error:
         messagebox.showerror("Database Error", f"Could not load the game:\n{error}")
         return
@@ -356,7 +450,6 @@ def edit_game():
     edit_window.grab_set()
     edit_window.configure(bg=OFFWHITE)
 
-    # Header bar
     hdr = tk.Frame(edit_window, bg=NAVY, height=48)
     hdr.pack(fill=tk.X)
     tk.Label(hdr, text="Edit Game", font=(FONT_BODY, 15, "bold"),
@@ -386,12 +479,23 @@ def edit_game():
     score_entry_edit.insert(0, str(current_score))
 
     if current_frames:
-        # Score is derived from frame data for imported games — don't allow manual edits.
         score_entry_edit.config(state="readonly", readonlybackground=ENTRY_BG)
 
     field_label(body, "CATEGORY")
     selected_category_var = tk.StringVar(value=current_category)
     style_dropdown(tk.OptionMenu(body, selected_category_var, *CATEGORIES)).pack(anchor="w")
+
+    field_label(body, "BALL")
+    arsenal_ball_names = get_arsenal_ball_names()
+    ball_choices_edit = [NO_BALL_LABEL] + arsenal_ball_names
+    if current_ball and current_ball not in arsenal_ball_names:
+        # Ball was set before it existed in (or after it was removed from)
+        # the Arsenal — keep it selectable so editing doesn't wipe it out.
+        ball_choices_edit.append(current_ball)
+    ball_var_edit = tk.StringVar(value=current_ball if current_ball else NO_BALL_LABEL)
+    ball_combo_edit = ttk.Combobox(body, textvariable=ball_var_edit, state="readonly",
+                                    font=(FONT_BODY, 12), width=22, values=ball_choices_edit)
+    ball_combo_edit.pack(anchor="w", ipady=4)
 
     if current_frames:
         note = tk.Frame(body, bg="#EFF6FF", relief="flat")
@@ -422,7 +526,6 @@ def edit_game():
             return
 
         if current_frames:
-            # Score is read-only here; keep whatever is currently stored/just-recalculated.
             try:
                 cursor.execute("SELECT score FROM games WHERE id = ?", (game_id,))
                 new_score = cursor.fetchone()[0]
@@ -441,15 +544,19 @@ def edit_game():
                 return
 
         try:
+            new_ball = ball_var_edit.get()
+            if new_ball == NO_BALL_LABEL:
+                new_ball = ""
             cursor.execute(
-                "UPDATE games SET date = ?, score = ?, category = ? WHERE id = ?",
-                (new_date, new_score, selected_category_var.get(), game_id)
+                "UPDATE games SET date = ?, score = ?, category = ?, ball = ? WHERE id = ?",
+                (new_date, new_score, selected_category_var.get(), new_ball or None, game_id)
             )
             connection.commit()
         except sqlite3.Error as error:
             messagebox.showerror("Database Error", f"Could not save changes:\n{error}")
             return
         edit_window.destroy()
+        refresh_ball_filter_options()
         update_history_display()
 
     btn_row = tk.Frame(body, bg=OFFWHITE)
@@ -463,11 +570,144 @@ def edit_game():
     edit_window.geometry(f"{w}x{h}")
 
 
+# ---------- BATCH EDIT GAMES ----------
+
+def batch_edit_games(game_ids):
+    """Edit Category and/or Ball across several games at once.
+    Only fields whose checkbox is checked get applied to every selected game."""
+
+    try:
+        cursor.execute(
+            f"SELECT date, score, category, ball FROM games WHERE id IN "
+            f"({','.join('?' for _ in game_ids)}) ORDER BY date",
+            game_ids
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not load the games:\n{error}")
+        return
+
+    batch_window = tk.Toplevel(window)
+    batch_window.title("Batch Edit Games")
+    batch_window.resizable(False, False)
+    batch_window.transient(window)
+    batch_window.grab_set()
+    batch_window.configure(bg=OFFWHITE)
+
+    hdr = tk.Frame(batch_window, bg=NAVY)
+    hdr.pack(fill=tk.X)
+    tk.Label(hdr, text=f"Batch Edit  ·  {len(game_ids)} Games", font=(FONT_BODY, 15, "bold"),
+             bg=NAVY, fg=WHITE).pack(side=tk.LEFT, padx=20, pady=12)
+
+    body = tk.Frame(batch_window, bg=OFFWHITE, padx=28, pady=18)
+    body.pack(fill=tk.BOTH)
+
+    tk.Label(body, text="Selected games", font=(FONT_BODY, 10, "bold"),
+             bg=OFFWHITE, fg=TEXT_MUTED).pack(anchor="w")
+
+    preview_frame = tk.Frame(body, bg=BORDER)
+    preview_frame.pack(fill=tk.X, pady=(4, 4))
+    preview = tk.Listbox(preview_frame, font=(FONT_MONO, 11), height=min(len(rows), 6),
+                         bg=CARD_BG, fg=TEXT, relief="flat", borderwidth=0,
+                         highlightthickness=0, activestyle="none")
+    preview.pack(padx=1, pady=1, fill=tk.X)
+    for game_date, score, category, ball in rows:
+        preview.insert(tk.END, f"  {to_display_date(game_date):<12} {score:>3}   "
+                                f"{category or '':<16} {ball or ''}")
+    preview.config(state="disabled")
+
+    tk.Label(body, text="Only the fields you check below will be changed. "
+                        "Everything else on these games stays as-is.",
+             font=(FONT_BODY, 9), bg=OFFWHITE, fg=TEXT_MUTED,
+             wraplength=340, justify=tk.LEFT).pack(anchor="w", pady=(10, 14))
+
+    # ── Category field ──
+    cat_row = tk.Frame(body, bg=OFFWHITE)
+    cat_row.pack(fill=tk.X, pady=(0, 10))
+    apply_category = tk.BooleanVar(value=False)
+    batch_category_var = tk.StringVar(value=GAME_CATEGORIES[0])
+    cat_dropdown = style_dropdown(tk.OptionMenu(cat_row, batch_category_var, *GAME_CATEGORIES))
+
+    def toggle_category():
+        cat_dropdown.config(state="normal" if apply_category.get() else "disabled")
+
+    tk.Checkbutton(cat_row, text="Set Category to:", variable=apply_category,
+                   command=toggle_category, font=(FONT_BODY, 11, "bold"),
+                   bg=OFFWHITE, fg=TEXT, activebackground=OFFWHITE,
+                   selectcolor=ENTRY_BG).pack(side=tk.LEFT, padx=(0, 10))
+    cat_dropdown.pack(side=tk.LEFT)
+    cat_dropdown.config(state="disabled")
+
+    # ── Ball field ──
+    ball_row = tk.Frame(body, bg=OFFWHITE)
+    ball_row.pack(fill=tk.X)
+    apply_ball = tk.BooleanVar(value=False)
+    batch_ball_var = tk.StringVar(value=NO_BALL_LABEL)
+    ball_dropdown = ttk.Combobox(ball_row, textvariable=batch_ball_var, state="disabled",
+                                  font=(FONT_BODY, 11), width=16,
+                                  values=[NO_BALL_LABEL] + get_arsenal_ball_names())
+
+    def toggle_ball():
+        ball_dropdown.config(state="readonly" if apply_ball.get() else "disabled")
+
+    tk.Checkbutton(ball_row, text="Set Ball to:", variable=apply_ball,
+                   command=toggle_ball, font=(FONT_BODY, 11, "bold"),
+                   bg=OFFWHITE, fg=TEXT, activebackground=OFFWHITE,
+                   selectcolor=ENTRY_BG).pack(side=tk.LEFT, padx=(0, 10))
+    ball_dropdown.pack(side=tk.LEFT)
+
+    def apply_batch():
+        if not apply_category.get() and not apply_ball.get():
+            messagebox.showwarning("Nothing to Change",
+                                   "Check at least one field to change.", parent=batch_window)
+            return
+
+        updates = []
+        if apply_category.get():
+            updates.append(("category", batch_category_var.get()))
+        if apply_ball.get():
+            new_ball = batch_ball_var.get()
+            updates.append(("ball", None if new_ball == NO_BALL_LABEL else new_ball))
+
+        summary = "\n".join(f"  • {field.capitalize()} → {value or 'None'}" for field, value in updates)
+        if not messagebox.askyesno(
+            "Apply Batch Edit",
+            f"Apply this to {len(game_ids)} games?\n\n{summary}",
+            parent=batch_window
+        ):
+            return
+
+        set_clause = ", ".join(f"{field} = ?" for field, _ in updates)
+        params = [value for _, value in updates]
+        try:
+            cursor.executemany(
+                f"UPDATE games SET {set_clause} WHERE id = ?",
+                [(*params, gid) for gid in game_ids]
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            messagebox.showerror("Database Error", f"Could not save changes:\n{error}", parent=batch_window)
+            return
+
+        batch_window.destroy()
+        refresh_ball_filter_options()
+        update_history_display()
+
+    btn_row = tk.Frame(body, bg=OFFWHITE)
+    btn_row.pack(pady=(20, 4))
+    make_button(btn_row, f"Apply to {len(game_ids)} Games", apply_batch, primary=True).pack(
+        side=tk.LEFT, padx=(0, 8))
+    make_button(btn_row, "Cancel", batch_window.destroy).pack(side=tk.LEFT)
+
+    batch_window.update_idletasks()
+    w = batch_window.winfo_reqwidth()
+    h = batch_window.winfo_reqheight()
+    batch_window.geometry(f"{w}x{h}")
+
+
 # ---------- FRAME DETAILS ----------
 
 def calculate_score_from_frames(frames):
-    """Compute a standard 10-pin bowling score from a list of frame dicts
-    (each with a 'throws' list of marks: 'X', '/', '-', or a digit string)."""
     flat_pins = []
     frame_start_index = []
     for frame in frames:
@@ -493,11 +733,11 @@ def calculate_score_from_frames(frames):
             continue
         if i < 9:
             first = flat_pins[start]
-            if first == 10:  # strike
+            if first == 10:
                 total += 10 + sum(flat_pins[start + 1:start + 3])
             elif len(throws) >= 2:
                 frame_sum = flat_pins[start] + flat_pins[start + 1]
-                if frame_sum == 10:  # spare
+                if frame_sum == 10:
                     bonus = flat_pins[start + 2] if len(flat_pins) > start + 2 else 0
                     total += 10 + bonus
                 else:
@@ -505,13 +745,11 @@ def calculate_score_from_frames(frames):
             else:
                 total += flat_pins[start]
         else:
-            # 10th frame: sum whatever throws were recorded (up to 3)
             total += sum(flat_pins[start:start + 3])
     return total
 
 
 def is_valid_throw_mark(mark):
-    """A throw mark must be 'X', '/', '-', or a single digit 0-9."""
     mark = mark.strip()
     if mark in ("X", "/", "-"):
         return True
@@ -546,6 +784,11 @@ def show_frame_details():
     if not selected:
         messagebox.showwarning("No Game Selected", "Please select an imported game first.")
         return
+    if len(selected) > 1:
+        messagebox.showinfo("Select One Game",
+                            "Frame details can only be shown for one game at a time. "
+                            "Please select a single game.")
+        return
 
     index = selected[0]
     game_id = displayed_ids[index]
@@ -574,7 +817,6 @@ def show_frame_details():
     details_window.resizable(False, False)
     details_window.transient(window)
 
-    # Header
     hdr = tk.Frame(details_window, bg=NAVY)
     hdr.pack(fill=tk.X)
     tk.Label(hdr, text=f"Frame Details", font=(FONT_BODY, 15, "bold"),
@@ -598,7 +840,6 @@ def show_frame_details():
         frame_box.grid_propagate(False)
         scorecard.grid_columnconfigure(frame_number - 1, weight=1)
 
-        # Frame number header
         num_bar = tk.Frame(frame_box, bg=NAVY_MID)
         num_bar.pack(fill=tk.X)
         tk.Label(num_bar, text=f"{frame_number}", font=(FONT_BODY, 9, "bold"),
@@ -626,8 +867,6 @@ def show_frame_details():
 
 
 def show_frame_editor(game_id, on_saved=None):
-    """Let the user correct individual throw marks for a game and recalculate its score.
-    Throws can only be corrected, not added or removed, to keep frame structure intact."""
     try:
         cursor.execute("SELECT date, score, frames FROM games WHERE id = ?", (game_id,))
         game_date, score, frame_data = cursor.fetchone()
@@ -648,7 +887,6 @@ def show_frame_editor(game_id, on_saved=None):
     editor.transient(window)
     editor.grab_set()
 
-    # Header
     hdr = tk.Frame(editor, bg=NAVY)
     hdr.pack(fill=tk.X)
     tk.Label(hdr, text="Edit Frame-by-Frame", font=(FONT_BODY, 15, "bold"),
@@ -665,7 +903,7 @@ def show_frame_editor(game_id, on_saved=None):
     scorecard = tk.Frame(editor, bg=OFFWHITE)
     scorecard.pack(fill=tk.X, padx=18, pady=(0, 8))
 
-    throw_entries = []  # list of (frame_index, throw_index, entry_widget)
+    throw_entries = []
 
     for frame_number, frame in enumerate(frames, start=1):
         is_last = frame_number == 10
@@ -695,7 +933,6 @@ def show_frame_editor(game_id, on_saved=None):
             throw_entries.append((frame_number - 1, throw_index, e))
 
     def recalculate_and_save():
-        # Read edited marks back into the frames structure
         updated_frames = [dict(f) for f in frames]
         for frame_index, throw_index, entry in throw_entries:
             mark = entry.get().strip().upper()
@@ -755,8 +992,6 @@ def show_frame_editor(game_id, on_saved=None):
 # ---------- IMPORT SCORESHEET ----------
 
 def find_duplicate_flags(player_records):
-    """Return a list of booleans (same length/order as player_records) marking which
-    records already exist in the DB, matched on date + score + center."""
     try:
         cursor.execute("SELECT date, score, center FROM games")
         existing = set()
@@ -785,7 +1020,6 @@ def show_import_review(player, player_records, file_name):
     centers_in_file = {record.get("center") for record in player_records if record.get("center")}
     center_line = ", ".join(sorted(centers_in_file)) if centers_in_file else "Unknown"
 
-    # Header
     hdr = tk.Frame(review_window, bg=NAVY)
     hdr.pack(fill=tk.X)
     tk.Label(hdr, text="Import Scoresheet", font=(FONT_BODY, 15, "bold"),
@@ -794,7 +1028,6 @@ def show_import_review(player, player_records, file_name):
     body = tk.Frame(review_window, bg=OFFWHITE, padx=24, pady=16)
     body.pack(fill=tk.BOTH)
 
-    # Meta info
     info_frame = tk.Frame(body, bg="#EFF6FF", highlightthickness=1, highlightbackground=BORDER)
     info_frame.pack(fill=tk.X, pady=(0, 12))
     tk.Label(info_frame, text=f"Player:  {player}", font=(FONT_BODY, 12, "bold"),
@@ -804,7 +1037,6 @@ def show_import_review(player, player_records, file_name):
     tk.Label(info_frame, text=f"File:      {file_name}", font=(FONT_BODY, 10),
              bg="#EFF6FF", fg=TEXT_MUTED, anchor="w").pack(fill=tk.X, padx=14, pady=(0, 10))
 
-    # Game list
     duplicate_flags = find_duplicate_flags(player_records)
     duplicate_count = sum(duplicate_flags)
 
@@ -833,7 +1065,6 @@ def show_import_review(player, player_records, file_name):
             wraplength=440, justify=tk.LEFT,
         ).pack(padx=10, pady=8)
 
-    # Category
     cat_row = tk.Frame(body, bg=OFFWHITE)
     cat_row.pack(pady=(14, 0))
     tk.Label(cat_row, text="Category:", font=(FONT_BODY, 12, "bold"),
@@ -844,17 +1075,33 @@ def show_import_review(player, player_records, file_name):
     tk.Label(body, text="Applied to every game in this file.",
              font=(FONT_BODY, 9), bg=OFFWHITE, fg=TEXT_MUTED).pack(pady=(4, 0))
 
+    ball_row = tk.Frame(body, bg=OFFWHITE)
+    ball_row.pack(pady=(10, 0))
+    tk.Label(ball_row, text="Ball:", font=(FONT_BODY, 12, "bold"),
+             bg=OFFWHITE, fg=TEXT).pack(side=tk.LEFT, padx=(0, 10))
+    import_ball_var = tk.StringVar(value=NO_BALL_LABEL)
+    import_ball_combo = ttk.Combobox(ball_row, textvariable=import_ball_var, state="readonly",
+                                      font=(FONT_BODY, 11), width=18,
+                                      values=[NO_BALL_LABEL] + get_arsenal_ball_names())
+    import_ball_combo.pack(side=tk.LEFT)
+
+    tk.Label(body, text="Also applied to every game in this file.",
+             font=(FONT_BODY, 9), bg=OFFWHITE, fg=TEXT_MUTED).pack(pady=(4, 0))
+
     def do_import(records_to_import):
         if not records_to_import:
             messagebox.showinfo("Nothing to Import", "No games left to import.", parent=review_window)
             return
         chosen_category = import_category_var.get()
+        chosen_ball = import_ball_var.get()
+        if chosen_ball == NO_BALL_LABEL:
+            chosen_ball = None
         try:
             cursor.executemany(
-                "INSERT INTO games (date, score, category, center, frames) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO games (date, score, category, center, frames, ball) VALUES (?, ?, ?, ?, ?, ?)",
                 [
                     (to_iso_date(record["date"]) or record["date"], record["score"], chosen_category,
-                     record.get("center") or None, json.dumps(record["frames"]))
+                     record.get("center") or None, json.dumps(record["frames"]), chosen_ball)
                     for record in records_to_import
                 ],
             )
@@ -864,6 +1111,7 @@ def show_import_review(player, player_records, file_name):
             return
         review_window.destroy()
         refresh_center_filter_options()
+        refresh_ball_filter_options()
         update_history_display()
         messagebox.showinfo("Import Complete", f"Imported {len(records_to_import)} game(s) for {player}.")
 
@@ -978,7 +1226,6 @@ def import_scoresheet():
 # ---------- INSIGHTS WINDOW ----------
 
 def categorize_frame(throws):
-    """Classify a single frame as 'strike', 'spare', or 'open' based on its throw marks."""
     if not throws:
         return None
     if throws[0] == "X":
@@ -990,7 +1237,7 @@ def categorize_frame(throws):
 
 def show_insights():
     try:
-        cursor.execute("SELECT date, score, category, frames FROM games ORDER BY date")
+        cursor.execute("SELECT date, score, category, frames, ball FROM games ORDER BY date")
         all_rows = cursor.fetchall()
     except sqlite3.Error as error:
         messagebox.showerror("Database Error", f"Could not load games:\n{error}")
@@ -1000,9 +1247,8 @@ def show_insights():
         messagebox.showinfo("No Data", "Add some games first to see insights.")
         return
 
-    # ── Parse all rows ──────────────────────────────────────────────────────
     parsed_games = []
-    for game_date, score, category, frame_data in all_rows:
+    for game_date, score, category, frame_data, ball in all_rows:
         d = parse_date_flexible(game_date)
         parsed_games.append({
             "date": d,
@@ -1010,12 +1256,12 @@ def show_insights():
             "score": score,
             "category": category or "Uncategorized",
             "frame_data": frame_data,
+            "ball": ball,
         })
 
     all_scores = [g["score"] for g in parsed_games]
     overall_avg = sum(all_scores) / len(all_scores)
 
-    # ── Strike / spare / open frame percentages (games with frame data only) ─
     strike_count = 0
     spare_count = 0
     open_count = 0
@@ -1038,8 +1284,6 @@ def show_insights():
                 open_count += 1
     total_frames_counted = strike_count + spare_count + open_count
 
-    # ── Streak tracking ─────────────────────────────────────────────────────
-    # Current above-average streak and longest ever
     current_streak = 0
     longest_streak = 0
     run = 0
@@ -1049,14 +1293,12 @@ def show_insights():
             longest_streak = max(longest_streak, run)
         else:
             run = 0
-    # current streak = tail of the list
     for g in reversed(parsed_games):
         if g["score"] >= overall_avg:
             current_streak += 1
         else:
             break
 
-    # ── Personal bests per category ─────────────────────────────────────────
     cat_stats = {}
     for g in parsed_games:
         cat = g["category"]
@@ -1065,14 +1307,22 @@ def show_insights():
         cat_stats[cat]["scores"].append(g["score"])
         cat_stats[cat]["best"] = max(cat_stats[cat]["best"], g["score"])
 
-    # ── Build window ────────────────────────────────────────────────────────
+    ball_stats = {}
+    for g in parsed_games:
+        if not g["ball"]:
+            continue
+        ball = g["ball"]
+        if ball not in ball_stats:
+            ball_stats[ball] = {"scores": [], "best": 0}
+        ball_stats[ball]["scores"].append(g["score"])
+        ball_stats[ball]["best"] = max(ball_stats[ball]["best"], g["score"])
+
     ins = tk.Toplevel(window)
     ins.title("Insights")
     ins.configure(bg=OFFWHITE)
     ins.resizable(False, False)
     ins.transient(window)
 
-    # Header
     hdr = tk.Frame(ins, bg=NAVY)
     hdr.pack(fill=tk.X)
     tk.Label(hdr, text="📊  Insights", font=(FONT_BODY, 15, "bold"),
@@ -1083,7 +1333,6 @@ def show_insights():
     body = tk.Frame(ins, bg=OFFWHITE, padx=20, pady=16)
     body.pack(fill=tk.BOTH)
 
-    # ── SECTION: Streak ──────────────────────────────────────────────────────
     def section_label(parent, text):
         tk.Label(parent, text=text, font=(FONT_BODY, 9, "bold"),
                  bg=OFFWHITE, fg=TEXT_MUTED).pack(anchor="w", pady=(14, 6))
@@ -1114,7 +1363,6 @@ def show_insights():
              font=(FONT_BODY, 10), bg=OFFWHITE, fg=TEXT_MUTED,
              justify=tk.LEFT).pack(side=tk.LEFT, padx=(8, 0))
 
-    # ── SECTION: Personal bests per category ─────────────────────────────────
     section_label(body, "PERSONAL BESTS BY CATEGORY")
 
     bests_frame = tk.Frame(body, bg=OFFWHITE)
@@ -1135,7 +1383,27 @@ def show_insights():
         tk.Label(card, text=f"avg {cat_avg:.1f}  ·  {len(data['scores'])} games",
                  font=(FONT_BODY, 9), bg=CARD_BG, fg=TEXT_MUTED).pack(anchor="w")
 
-    # ── SECTION: Strike / spare / open percentages ────────────────────────────
+    if ball_stats:
+        section_label(body, "PERSONAL BESTS BY BALL")
+
+        ball_frame = tk.Frame(body, bg=OFFWHITE)
+        ball_frame.pack(fill=tk.X)
+
+        for i, (ball, data) in enumerate(sorted(ball_stats.items())):
+            ball_avg = sum(data["scores"]) / len(data["scores"])
+            card = tk.Frame(ball_frame, bg=CARD_BG,
+                            highlightthickness=1, highlightbackground=BORDER,
+                            padx=16, pady=12)
+            card.grid(row=i // 3, column=i % 3, padx=(0, 10), pady=(0, 10), sticky="nsew")
+            ball_frame.grid_columnconfigure(i % 3, weight=1)
+
+            tk.Label(card, text=ball, font=(FONT_BODY, 10, "bold"),
+                     bg=CARD_BG, fg=TEXT).pack(anchor="w")
+            tk.Label(card, text=str(data["best"]),
+                     font=(FONT_BODY, 26, "bold"), bg=CARD_BG, fg=AMBER).pack(anchor="w")
+            tk.Label(card, text=f"avg {ball_avg:.1f}  ·  {len(data['scores'])} games",
+                     font=(FONT_BODY, 9), bg=CARD_BG, fg=TEXT_MUTED).pack(anchor="w")
+
     if games_with_frames > 0 and total_frames_counted > 0:
         section_label(body, "STRIKE & SPARE PERCENTAGE  "
                              f"(from {games_with_frames} imported game(s) with frame data)")
@@ -1157,13 +1425,10 @@ def show_insights():
                      font=(FONT_BODY, 8), bg=CARD_BG, fg=TEXT_MUTED).pack()
 
         pct_card(pct_row, "STRIKE RATE", strike_count, total_frames_counted, AMBER)
-        # Spare rate is conventionally measured against spare *opportunities*
-        # (frames where the first ball didn't strike), not all frames.
         spare_opportunities = spare_count + open_count
         pct_card(pct_row, "SPARE CONVERSION", spare_count, spare_opportunities, GREEN)
         pct_card(pct_row, "OPEN FRAMES", open_count, total_frames_counted, RED)
 
-    # ── SECTION: Score trend chart ────────────────────────────────────────────
     section_label(body, "SCORE TREND  (all games, chronological)")
 
     CHART_W, CHART_H = 700, 180
@@ -1189,7 +1454,6 @@ def show_insights():
     def sy(s):
         return PAD_T + (1 - (s - lo) / score_range) * (CHART_H - PAD_T - PAD_B)
 
-    # Gridlines + Y labels
     for val in [lo, (lo + hi) // 2, hi]:
         y = sy(val)
         canvas.create_line(PAD_L, y, CHART_W - PAD_R, y,
@@ -1197,20 +1461,17 @@ def show_insights():
         canvas.create_text(PAD_L - 6, y, text=str(val),
                            font=(FONT_BODY, 8), fill=TEXT_MUTED, anchor="e")
 
-    # Average line
     avg_y = sy(overall_avg)
     canvas.create_line(PAD_L, avg_y, CHART_W - PAD_R, avg_y,
                        fill=AMBER, dash=(6, 3), width=1)
     canvas.create_text(CHART_W - PAD_R + 2, avg_y,
                        text=f"avg", font=(FONT_BODY, 7), fill=AMBER, anchor="w")
 
-    # Score line
     if n > 1:
         points = [(sx(i), sy(s)) for i, s in enumerate(plot_scores)]
         flat = [coord for pt in points for coord in pt]
         canvas.create_line(*flat, fill=NAVY, width=2, smooth=True)
 
-    # Dots + hover tooltip
     dot_ids = []
     tooltip_label = tk.Label(chart_frame, font=(FONT_BODY, 9, "bold"),
                               bg=NAVY, fg=WHITE, padx=6, pady=3, relief="flat")
@@ -1235,7 +1496,6 @@ def show_insights():
         canvas.tag_bind(dot, "<Leave>", leave_cb)
         dot_ids.append(dot)
 
-    # X-axis labels: first, last, and a few in between
     label_indices = sorted(set([0, n - 1] + [n // 4, n // 2, 3 * n // 4]))
     for i in label_indices:
         if 0 <= i < n:
@@ -1243,7 +1503,6 @@ def show_insights():
                                text=parsed_games[i]["date_str"],
                                font=(FONT_BODY, 7), fill=TEXT_MUTED, angle=0)
 
-    # Legend
     legend = tk.Frame(body, bg=OFFWHITE)
     legend.pack(anchor="w", pady=(2, 10))
     for color, label in [(GREEN, "At/above avg"), (RED, "Below avg"), (AMBER, "Your average")]:
@@ -1271,7 +1530,7 @@ def export_to_csv():
         return
 
     try:
-        cursor.execute("SELECT date, score, category, center FROM games ORDER BY date")
+        cursor.execute("SELECT date, score, category, center, ball FROM games ORDER BY date")
         rows = cursor.fetchall()
     except sqlite3.Error as error:
         messagebox.showerror("Database Error", f"Could not load games:\n{error}")
@@ -1284,9 +1543,9 @@ def export_to_csv():
     try:
         with open(file_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["Date", "Score", "Category", "Center"])
-            for game_date, score, category, center in rows:
-                writer.writerow([to_display_date(game_date), score, category or "", center or ""])
+            writer.writerow(["Date", "Score", "Category", "Center", "Ball"])
+            for game_date, score, category, center, ball in rows:
+                writer.writerow([to_display_date(game_date), score, category or "", center or "", ball or ""])
     except OSError as error:
         messagebox.showerror("Export Failed", f"Could not write the CSV file:\n{error}")
         return
@@ -1306,7 +1565,7 @@ def backup_database():
         return
 
     try:
-        connection.commit()  # make sure everything on disk is current before copying
+        connection.commit()
         shutil.copy2(os.path.join(APP_FOLDER, "bowling.db"), file_path)
     except OSError as error:
         messagebox.showerror("Backup Failed", f"Could not copy the database file:\n{error}")
@@ -1347,6 +1606,18 @@ def make_button(parent, text, command, primary=False, danger=False):
     return btn
 
 
+def make_secondary_button(parent, text, command):
+    btn = tk.Button(
+        parent, text=text, command=command,
+        font=(FONT_BODY, 10),
+        bg=OFFWHITE, fg=TEXT_MUTED, activebackground=BORDER, activeforeground=TEXT,
+        relief="flat", cursor="hand2",
+        padx=14, pady=6, borderwidth=0,
+        highlightthickness=1, highlightbackground=BORDER,
+    )
+    return btn
+
+
 def style_dropdown(menu):
     menu.config(
         font=(FONT_BODY, 11),
@@ -1371,20 +1642,18 @@ def style_dropdown(menu):
 window = tk.Tk()
 window.title("Bowling Tracker")
 window.geometry("980x680")
-window.resizable(False, False)
+window.minsize(860, 560)
+window.resizable(True, True)
 window.protocol("WM_DELETE_WINDOW", on_close)
 window.configure(bg=OFFWHITE)
 
 
 # ── SCOREBOARD HEADER ─────────────────────────────────────────────────────────
-# Dark navy bar with amber numbers — the signature visual element of this design.
-# Looks like an actual bowling alley overhead scoreboard.
 
 scoreboard = tk.Frame(window, bg=NAVY, height=110)
 scoreboard.pack(fill=tk.X)
 scoreboard.pack_propagate(False)
 
-# App name / branding on the far left
 brand_frame = tk.Frame(scoreboard, bg=NAVY)
 brand_frame.pack(side=tk.LEFT, padx=(24, 0))
 tk.Label(brand_frame, text="🎳", font=("Arial", 26),
@@ -1396,10 +1665,8 @@ tk.Label(title_stack, text="BOWLING", font=(FONT_BODY, 13, "bold"),
 tk.Label(title_stack, text="TRACKER", font=(FONT_BODY, 9),
          bg=NAVY, fg="#5B7FA6", anchor="w").pack(anchor="w")
 
-# Divider line
 tk.Frame(scoreboard, bg=NAVY_MID, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=20, pady=14)
 
-# Stats — right side of header
 stats_area = tk.Frame(scoreboard, bg=NAVY)
 stats_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -1432,47 +1699,63 @@ low_value     = stat_widgets["low_value"]
 
 entry_card = tk.Frame(window, bg=CARD_BG,
                       highlightthickness=1, highlightbackground=BORDER)
-entry_card.pack(fill=tk.X, padx=20, pady=(16, 0))
+entry_card.pack(fill=tk.X, padx=SPACE_LG - 4, pady=(SPACE_MD, 0))
 
-entry_inner = tk.Frame(entry_card, bg=CARD_BG, pady=14, padx=18)
+entry_inner = tk.Frame(entry_card, bg=CARD_BG, pady=SPACE_MD - 2, padx=SPACE_MD + 2)
 entry_inner.pack(fill=tk.X)
 
-# Section label
 tk.Label(entry_inner, text="ADD GAME", font=(FONT_BODY, 9, "bold"),
-         bg=CARD_BG, fg=TEXT_MUTED).grid(row=0, column=0, columnspan=7, sticky="w", pady=(0, 8))
+         bg=CARD_BG, fg=TEXT_MUTED).grid(row=0, column=0, columnspan=11, sticky="w", pady=(0, SPACE_SM))
 
-# Date
 tk.Label(entry_inner, text="Date", font=(FONT_BODY, 10, "bold"),
          bg=CARD_BG, fg=TEXT).grid(row=1, column=0, sticky="w")
 date_entry = tk.Entry(entry_inner, font=(FONT_BODY, 13), width=13,
                       bg=ENTRY_BG, relief="flat",
                       highlightthickness=1, highlightbackground=BORDER,
                       highlightcolor=AMBER)
-date_entry.grid(row=1, column=1, padx=(6, 20), ipady=6, ipadx=4)
+date_entry.grid(row=1, column=1, padx=(SPACE_XS + 2, SPACE_MD + 4), ipady=6, ipadx=4)
 date_entry.insert(0, date.today().strftime("%m/%d/%Y"))
 
-# Score
 tk.Label(entry_inner, text="Score", font=(FONT_BODY, 10, "bold"),
          bg=CARD_BG, fg=TEXT).grid(row=1, column=2, sticky="w")
 score_entry = tk.Entry(entry_inner, font=(FONT_BODY, 13), width=7,
                        bg=ENTRY_BG, relief="flat",
                        highlightthickness=1, highlightbackground=BORDER,
                        highlightcolor=AMBER)
-score_entry.grid(row=1, column=3, padx=(6, 20), ipady=6, ipadx=4)
+score_entry.grid(row=1, column=3, padx=(SPACE_XS + 2, SPACE_MD + 4), ipady=6, ipadx=4)
 
-# Category
 tk.Label(entry_inner, text="Category", font=(FONT_BODY, 10, "bold"),
          bg=CARD_BG, fg=TEXT).grid(row=1, column=4, sticky="w")
 new_game_category_var = tk.StringVar(value=GAME_CATEGORIES[0])
 cat_menu = style_dropdown(tk.OptionMenu(entry_inner, new_game_category_var, *GAME_CATEGORIES))
-cat_menu.grid(row=1, column=5, padx=(6, 20))
+cat_menu.grid(row=1, column=5, padx=(SPACE_XS + 2, SPACE_MD + 4))
 
-# Buttons
+tk.Label(entry_inner, text="Ball", font=(FONT_BODY, 10, "bold"),
+         bg=CARD_BG, fg=TEXT).grid(row=1, column=6, sticky="w")
+ball_var = tk.StringVar(value=NO_BALL_LABEL)
+ball_combo = ttk.Combobox(entry_inner, textvariable=ball_var, state="readonly",
+                           font=(FONT_BODY, 11), width=14)
+ball_combo.grid(row=1, column=7, padx=(SPACE_XS + 2, SPACE_MD + 4), ipady=4)
+
+
+def refresh_ball_choices(*args):
+    """Repopulate every ball dropdown from the current Arsenal roster.
+    Called at boot and whenever the main window regains focus, so balls
+    added in the Arsenal window show up without restarting the app."""
+    names = get_arsenal_ball_names()
+    values = [NO_BALL_LABEL] + names
+    ball_combo["values"] = values
+    if ball_var.get() not in values:
+        ball_var.set(NO_BALL_LABEL)
+
+
+tk.Frame(entry_inner, bg=BORDER, width=1).grid(row=1, column=8, sticky="ns", padx=(0, SPACE_MD))
+
 add_button = make_button(entry_inner, "Add Game", add_game, primary=True)
-add_button.grid(row=1, column=6, padx=(0, 8))
+add_button.grid(row=1, column=9, padx=(0, SPACE_SM))
 
 import_button = make_button(entry_inner, "Import Scoresheet", import_scoresheet)
-import_button.grid(row=1, column=7)
+import_button.grid(row=1, column=10)
 
 
 # ── HISTORY SECTION ───────────────────────────────────────────────────────────
@@ -1481,33 +1764,54 @@ history_card = tk.Frame(window, bg=CARD_BG,
                         highlightthickness=1, highlightbackground=BORDER)
 history_card.pack(fill=tk.BOTH, expand=True, padx=20, pady=(12, 0))
 
-# ── History header: ROW 1 — title + Category + Center filters ────────────────
-hist_hdr = tk.Frame(history_card, bg=CARD_BG, pady=8, padx=18)
+hist_hdr = tk.Frame(history_card, bg=CARD_BG, pady=SPACE_SM + 2, padx=SPACE_MD + 2)
 hist_hdr.pack(fill=tk.X)
 
 tk.Label(hist_hdr, text="GAME HISTORY", font=(FONT_BODY, 9, "bold"),
          bg=CARD_BG, fg=TEXT_MUTED).pack(side=tk.LEFT)
 
-filter_row1 = tk.Frame(hist_hdr, bg=CARD_BG)
-filter_row1.pack(side=tk.RIGHT)
+filter_row = tk.Frame(history_card, bg="#F8FAFC",
+                       highlightthickness=1, highlightbackground=BORDER,
+                       pady=SPACE_SM + 1, padx=SPACE_MD + 2)
+filter_row.pack(fill=tk.X)
 
-tk.Label(filter_row1, text="Category:", font=(FONT_BODY, 10, "bold"),
-         bg=CARD_BG, fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
+def toolbar_divider(parent):
+    tk.Frame(parent, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=SPACE_MD, pady=2)
+
+tk.Label(filter_row, text="Category:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, SPACE_XS + 2))
 category_filter_var = tk.StringVar(value="All")
-cat_filter_menu = style_dropdown(tk.OptionMenu(filter_row1, category_filter_var, *CATEGORIES))
-cat_filter_menu.pack(side=tk.LEFT, padx=(0, 16))
+cat_filter_menu = style_dropdown(tk.OptionMenu(filter_row, category_filter_var, *CATEGORIES))
+cat_filter_menu.pack(side=tk.LEFT)
 category_filter_var.trace("w", lambda *args: update_history_display())
 
-tk.Label(filter_row1, text="Center:", font=(FONT_BODY, 10, "bold"),
-         bg=CARD_BG, fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
+toolbar_divider(filter_row)
+
+tk.Label(filter_row, text="Center:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, SPACE_XS + 2))
 center_filter_var = tk.StringVar(value="All")
-center_filter_menu = ttk.Combobox(filter_row1, textvariable=center_filter_var,
-                                   state="readonly", font=(FONT_BODY, 11), width=18)
+center_filter_menu = ttk.Combobox(filter_row, textvariable=center_filter_var,
+                                   state="readonly", font=(FONT_BODY, 11), width=16)
 center_filter_menu["values"] = ["All"]
 center_filter_menu.pack(side=tk.LEFT)
 center_filter_menu.bind("<<ComboboxSelected>>", lambda event: update_history_display())
 
-# ── History header: ROW 2 — time frame filters ────────────────────────────────
+toolbar_divider(filter_row)
+
+tk.Label(filter_row, text="Ball:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, SPACE_XS + 2))
+ball_filter_var = tk.StringVar(value="All")
+ball_filter_menu = ttk.Combobox(filter_row, textvariable=ball_filter_var,
+                                 state="readonly", font=(FONT_BODY, 11), width=14)
+ball_filter_menu["values"] = ["All"]
+ball_filter_menu.pack(side=tk.LEFT)
+ball_filter_menu.bind("<<ComboboxSelected>>", lambda event: update_history_display())
+
+toolbar_divider(filter_row)
+
+tk.Label(filter_row, text="Time frame:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, SPACE_XS + 2))
+
 QUICK_PICKS = [
     "All Time", "Today", "This Week", "Last 30 Days",
     "This Year", "Last Year",
@@ -1515,41 +1819,31 @@ QUICK_PICKS = [
     "July", "August", "September", "October", "November", "December",
 ]
 
-filter_row2 = tk.Frame(history_card, bg="#F8FAFC",
-                        highlightthickness=1, highlightbackground=BORDER,
-                        pady=7, padx=18)
-filter_row2.pack(fill=tk.X)
-
-tk.Label(filter_row2, text="TIME FRAME", font=(FONT_BODY, 8, "bold"),
-         bg="#F8FAFC", fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 10))
-
 time_quick_var = tk.StringVar(value="All Time")
-quick_menu = style_dropdown(tk.OptionMenu(filter_row2, time_quick_var, *QUICK_PICKS))
-quick_menu.config(width=12)
-quick_menu.pack(side=tk.LEFT, padx=(0, 20))
+quick_menu = style_dropdown(tk.OptionMenu(filter_row, time_quick_var, *QUICK_PICKS))
+quick_menu.config(width=11)
+quick_menu.pack(side=tk.LEFT)
 time_quick_var.trace("w", apply_quick_pick)
 
-# Divider
-tk.Frame(filter_row2, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16), pady=2)
+toolbar_divider(filter_row)
 
-tk.Label(filter_row2, text="From:", font=(FONT_BODY, 10, "bold"),
-         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
-date_from_entry = tk.Entry(filter_row2, font=(FONT_BODY, 11), width=12,
+tk.Label(filter_row, text="From:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, SPACE_XS + 2))
+date_from_entry = tk.Entry(filter_row, font=(FONT_BODY, 11), width=11,
                             bg=ENTRY_BG, relief="flat",
                             highlightthickness=1, highlightbackground=BORDER,
                             highlightcolor=AMBER)
-date_from_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, 14))
+date_from_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, SPACE_MD - 2))
 
-tk.Label(filter_row2, text="To:", font=(FONT_BODY, 10, "bold"),
-         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
-date_to_entry = tk.Entry(filter_row2, font=(FONT_BODY, 11), width=12,
+tk.Label(filter_row, text="To:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, SPACE_XS + 2))
+date_to_entry = tk.Entry(filter_row, font=(FONT_BODY, 11), width=11,
                           bg=ENTRY_BG, relief="flat",
                           highlightthickness=1, highlightbackground=BORDER,
                           highlightcolor=AMBER)
-date_to_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, 14))
+date_to_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, SPACE_SM))
 
 def on_date_entry_change(event):
-    # Clear the quick pick label when the user types custom dates
     time_quick_var.set("Custom")
     update_history_display()
 
@@ -1559,22 +1853,51 @@ date_to_entry.bind("<Return>", on_date_entry_change)
 date_to_entry.bind("<FocusOut>", on_date_entry_change)
 
 def clear_time_filter():
-    time_quick_var.set("All Time")  # triggers apply_quick_pick which clears entries + refreshes
+    time_quick_var.set("All Time")
 
-clear_btn = make_button(filter_row2, "Clear", clear_time_filter)
+clear_btn = make_secondary_button(filter_row, "Clear", clear_time_filter)
 clear_btn.pack(side=tk.LEFT)
 
-# Column header strip
 col_hdr = tk.Frame(history_card, bg="#EFF4FB", pady=5)
 col_hdr.pack(fill=tk.X)
-tk.Label(col_hdr, text="  DATE", font=(FONT_BODY, 9, "bold"),
-         bg="#EFF4FB", fg=TEXT_MUTED, width=26, anchor="w").pack(side=tk.LEFT)
-tk.Label(col_hdr, text="SCORE", font=(FONT_BODY, 9, "bold"),
-         bg="#EFF4FB", fg=TEXT_MUTED, width=6, anchor="w").pack(side=tk.LEFT)
-tk.Label(col_hdr, text="CATEGORY", font=(FONT_BODY, 9, "bold"),
-         bg="#EFF4FB", fg=TEXT_MUTED, width=18, anchor="w").pack(side=tk.LEFT)
 
-# Listbox + scrollbar
+def sort_arrow(column):
+    if sort_column != column:
+        return ""
+    return " ▲" if sort_ascending else " ▼"
+
+def set_sort(column):
+    global sort_column, sort_ascending
+    if sort_column == column:
+        sort_ascending = not sort_ascending
+    else:
+        sort_column = column
+        sort_ascending = True
+    refresh_column_headers()
+    update_history_display()
+
+column_header_labels = {}
+
+def make_column_header(parent, text, column, width):
+    lbl = tk.Label(parent, text=text + sort_arrow(column), font=(FONT_MONO, 12, "bold"),
+                    bg="#EFF4FB", fg=TEXT_MUTED, width=width, anchor="w", cursor="hand2")
+    lbl.pack(side=tk.LEFT)
+    lbl.bind("<Button-1>", lambda event: set_sort(column))
+    column_header_labels[column] = (lbl, text)
+    return lbl
+
+def refresh_column_headers():
+    for column, (lbl, base_text) in column_header_labels.items():
+        lbl.config(
+            text=base_text + sort_arrow(column),
+            fg=TEXT if sort_column == column else TEXT_MUTED,
+        )
+
+make_column_header(col_hdr, "  DATE", "date", 25)
+make_column_header(col_hdr, "SCORE", "score", 6)
+make_column_header(col_hdr, "CATEGORY", "category", 17)
+make_column_header(col_hdr, "BALL", "ball", 14)
+
 list_frame = tk.Frame(history_card, bg=CARD_BG)
 list_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -1591,6 +1914,7 @@ history = tk.Listbox(
     bg=CARD_BG, fg=TEXT,
     relief="flat", borderwidth=0,
     highlightthickness=0,
+    selectmode=tk.EXTENDED,
 )
 history.pack(fill=tk.BOTH, expand=True)
 scrollbar.config(command=history.yview)
@@ -1599,18 +1923,33 @@ scrollbar.config(command=history.yview)
 # ── ACTION BUTTONS ────────────────────────────────────────────────────────────
 
 action_bar = tk.Frame(window, bg=OFFWHITE)
-action_bar.pack(fill=tk.X, padx=20, pady=(10, 16))
+action_bar.pack(fill=tk.X, padx=SPACE_LG - 4, pady=(SPACE_SM + 2, SPACE_MD))
 
-make_button(action_bar, "✏  Edit Game", edit_game).pack(side=tk.LEFT, padx=(0, 8))
-make_button(action_bar, "📋  Frame Details", show_frame_details).pack(side=tk.LEFT, padx=(0, 8))
-make_button(action_bar, "🗑  Delete Game", delete_game, danger=True).pack(side=tk.LEFT, padx=(0, 8))
-make_button(action_bar, "⬇  Export CSV", export_to_csv).pack(side=tk.LEFT, padx=(0, 8))
-make_button(action_bar, "💾  Backup DB", backup_database).pack(side=tk.LEFT, padx=(0, 8))
+game_actions = tk.Frame(action_bar, bg=OFFWHITE)
+game_actions.pack(side=tk.LEFT)
+make_button(game_actions, "✏  Edit", edit_game).pack(side=tk.LEFT, padx=(0, SPACE_SM))
+make_button(game_actions, "📋  Frame Details", show_frame_details).pack(side=tk.LEFT, padx=(0, SPACE_SM))
+make_button(game_actions, "🗑  Delete", delete_game, danger=True).pack(side=tk.LEFT)
+
+tk.Frame(action_bar, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=SPACE_MD, pady=4)
+
+data_actions = tk.Frame(action_bar, bg=OFFWHITE)
+data_actions.pack(side=tk.LEFT)
+make_secondary_button(data_actions, "⬇  Export CSV", export_to_csv).pack(side=tk.LEFT, padx=(0, SPACE_SM))
+make_secondary_button(data_actions, "💾  Backup DB", backup_database).pack(side=tk.LEFT)
+
+# Arsenal and Insights pinned to the right
 make_button(action_bar, "📊  Insights", show_insights, primary=True).pack(side=tk.RIGHT)
+make_button(action_bar, "🎳  Arsenal",
+            lambda: show_arsenal(window, connection, cursor, DESIGN_TOKENS)
+            ).pack(side=tk.RIGHT, padx=(0, SPACE_SM))
 
 
 # ── BOOT ──────────────────────────────────────────────────────────────────────
 
 refresh_center_filter_options()
+refresh_ball_filter_options()
+refresh_ball_choices()
+window.bind("<FocusIn>", refresh_ball_choices)
 update_history_display()
 window.mainloop()
