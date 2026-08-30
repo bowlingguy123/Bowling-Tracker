@@ -4,7 +4,8 @@ import tkinter as tk
 import json
 from tkinter import filedialog, messagebox, ttk
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta
+import calendar
 from scoresheet_importer import read_scoresheet
 
 
@@ -97,9 +98,72 @@ def update_stats():
 
 # ---------- LOAD / FILTER GAMES ----------
 
+def parse_date_flexible(date_str):
+    """Try common date formats and return a date object, or None on failure."""
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def get_date_range_from_quick_pick(pick):
+    """Return (date_from, date_to) strings for a quick-pick label, or (None, None)."""
+    today = date.today()
+    if pick == "All Time":
+        return None, None
+    elif pick == "Today":
+        s = today.strftime("%m/%d/%Y")
+        return s, s
+    elif pick == "This Week":
+        start = today - timedelta(days=today.weekday())
+        return start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
+    elif pick == "Last 30 Days":
+        return (today - timedelta(days=30)).strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
+    elif pick == "This Year":
+        return f"01/01/{today.year}", today.strftime("%m/%d/%Y")
+    elif pick == "Last Year":
+        y = today.year - 1
+        return f"01/01/{y}", f"12/31/{y}"
+    else:
+        # Month names: "January", "February", …
+        for month_num, month_name in enumerate(
+            ["January","February","March","April","May","June",
+             "July","August","September","October","November","December"], start=1
+        ):
+            if pick == month_name:
+                year = today.year
+                last_day = calendar.monthrange(year, month_num)[1]
+                return f"{month_num:02d}/01/{year}", f"{month_num:02d}/{last_day:02d}/{year}"
+    return None, None
+
+
+def apply_quick_pick(*args):
+    """When the quick-pick dropdown changes, populate the From/To fields and refresh."""
+    pick = time_quick_var.get()
+    d_from, d_to = get_date_range_from_quick_pick(pick)
+    date_from_entry.delete(0, tk.END)
+    date_to_entry.delete(0, tk.END)
+    if d_from:
+        date_from_entry.insert(0, d_from)
+    if d_to:
+        date_to_entry.insert(0, d_to)
+    update_history_display()
+
+
 def update_history_display():
     selected_category = category_filter_var.get()
     selected_center = center_filter_var.get()
+    try:
+        date_from_str = date_from_entry.get().strip()
+        date_to_str   = date_to_entry.get().strip()
+    except NameError:
+        date_from_str = ""
+        date_to_str   = ""
+
+    date_from = parse_date_flexible(date_from_str) if date_from_str else None
+    date_to   = parse_date_flexible(date_to_str)   if date_to_str   else None
 
     conditions = []
     params = []
@@ -126,12 +190,23 @@ def update_history_display():
     scores.clear()
     displayed_ids.clear()
 
-    for i, (game_id, game_date, score, category) in enumerate(rows):
+    display_i = 0
+    for (game_id, game_date, score, category) in rows:
+        # Apply date range filter in Python (dates stored in mixed formats)
+        if date_from or date_to:
+            parsed = parse_date_flexible(game_date)
+            if parsed is None:
+                continue
+            if date_from and parsed < date_from:
+                continue
+            if date_to and parsed > date_to:
+                continue
+
         scores.append(score)
         displayed_ids.append(game_id)
-        tag = "even" if i % 2 == 0 else "odd"
         history.insert(tk.END, f"  {game_date:<22} {score:>3}   {category}")
-        history.itemconfig(i, **{"bg": "#F8FAFC" if tag == "even" else CARD_BG})
+        history.itemconfig(display_i, **{"bg": "#F8FAFC" if display_i % 2 == 0 else CARD_BG})
+        display_i += 1
 
     update_stats()
 
@@ -589,6 +664,227 @@ def import_scoresheet():
     choose_player(records, os.path.basename(file_path))
 
 
+# ---------- INSIGHTS WINDOW ----------
+
+def show_insights():
+    try:
+        cursor.execute("SELECT date, score, category FROM games ORDER BY id")
+        all_rows = cursor.fetchall()
+    except sqlite3.Error as error:
+        messagebox.showerror("Database Error", f"Could not load games:\n{error}")
+        return
+
+    if not all_rows:
+        messagebox.showinfo("No Data", "Add some games first to see insights.")
+        return
+
+    # ── Parse all rows ──────────────────────────────────────────────────────
+    parsed_games = []
+    for game_date, score, category in all_rows:
+        d = parse_date_flexible(game_date)
+        parsed_games.append({
+            "date": d,
+            "date_str": game_date,
+            "score": score,
+            "category": category or "Uncategorized",
+        })
+    parsed_games.sort(key=lambda g: g["date"] or date.min)
+
+    all_scores = [g["score"] for g in parsed_games]
+    overall_avg = sum(all_scores) / len(all_scores)
+
+    # ── Streak tracking ─────────────────────────────────────────────────────
+    # Current above-average streak and longest ever
+    current_streak = 0
+    longest_streak = 0
+    run = 0
+    for g in parsed_games:
+        if g["score"] >= overall_avg:
+            run += 1
+            longest_streak = max(longest_streak, run)
+        else:
+            run = 0
+    # current streak = tail of the list
+    for g in reversed(parsed_games):
+        if g["score"] >= overall_avg:
+            current_streak += 1
+        else:
+            break
+
+    # ── Personal bests per category ─────────────────────────────────────────
+    cat_stats = {}
+    for g in parsed_games:
+        cat = g["category"]
+        if cat not in cat_stats:
+            cat_stats[cat] = {"scores": [], "best": 0}
+        cat_stats[cat]["scores"].append(g["score"])
+        cat_stats[cat]["best"] = max(cat_stats[cat]["best"], g["score"])
+
+    # ── Build window ────────────────────────────────────────────────────────
+    ins = tk.Toplevel(window)
+    ins.title("Insights")
+    ins.configure(bg=OFFWHITE)
+    ins.resizable(False, False)
+    ins.transient(window)
+
+    # Header
+    hdr = tk.Frame(ins, bg=NAVY)
+    hdr.pack(fill=tk.X)
+    tk.Label(hdr, text="📊  Insights", font=(FONT_BODY, 15, "bold"),
+             bg=NAVY, fg=WHITE).pack(side=tk.LEFT, padx=20, pady=14)
+    tk.Label(hdr, text=f"{len(parsed_games)} games  ·  avg {overall_avg:.1f}",
+             font=(FONT_BODY, 11), bg=NAVY, fg=AMBER).pack(side=tk.LEFT, pady=14)
+
+    body = tk.Frame(ins, bg=OFFWHITE, padx=20, pady=16)
+    body.pack(fill=tk.BOTH)
+
+    # ── SECTION: Streak ──────────────────────────────────────────────────────
+    def section_label(parent, text):
+        tk.Label(parent, text=text, font=(FONT_BODY, 9, "bold"),
+                 bg=OFFWHITE, fg=TEXT_MUTED).pack(anchor="w", pady=(14, 6))
+
+    section_label(body, "STREAK  (games at or above your average)")
+
+    streak_row = tk.Frame(body, bg=OFFWHITE)
+    streak_row.pack(fill=tk.X)
+
+    def streak_card(parent, label, value, highlight=False):
+        card = tk.Frame(parent, bg=NAVY if highlight else CARD_BG,
+                        highlightthickness=1, highlightbackground=BORDER,
+                        padx=24, pady=14)
+        card.pack(side=tk.LEFT, padx=(0, 12))
+        tk.Label(card, text=str(value),
+                 font=(FONT_BODY, 32, "bold"),
+                 bg=NAVY if highlight else CARD_BG,
+                 fg=AMBER if highlight else TEXT).pack()
+        tk.Label(card, text=label,
+                 font=(FONT_BODY, 9, "bold"),
+                 bg=NAVY if highlight else CARD_BG,
+                 fg="#5B7FA6" if highlight else TEXT_MUTED).pack()
+
+    streak_card(streak_row, "CURRENT STREAK", current_streak, highlight=True)
+    streak_card(streak_row, "LONGEST STREAK", longest_streak)
+    tk.Label(streak_row,
+             text=f"Your average is {overall_avg:.1f}.\nGames at or above that count toward a streak.",
+             font=(FONT_BODY, 10), bg=OFFWHITE, fg=TEXT_MUTED,
+             justify=tk.LEFT).pack(side=tk.LEFT, padx=(8, 0))
+
+    # ── SECTION: Personal bests per category ─────────────────────────────────
+    section_label(body, "PERSONAL BESTS BY CATEGORY")
+
+    bests_frame = tk.Frame(body, bg=OFFWHITE)
+    bests_frame.pack(fill=tk.X)
+
+    for i, (cat, data) in enumerate(sorted(cat_stats.items())):
+        cat_avg = sum(data["scores"]) / len(data["scores"])
+        card = tk.Frame(bests_frame, bg=CARD_BG,
+                        highlightthickness=1, highlightbackground=BORDER,
+                        padx=16, pady=12)
+        card.grid(row=i // 3, column=i % 3, padx=(0, 10), pady=(0, 10), sticky="nsew")
+        bests_frame.grid_columnconfigure(i % 3, weight=1)
+
+        tk.Label(card, text=cat, font=(FONT_BODY, 10, "bold"),
+                 bg=CARD_BG, fg=TEXT).pack(anchor="w")
+        tk.Label(card, text=str(data["best"]),
+                 font=(FONT_BODY, 26, "bold"), bg=CARD_BG, fg=AMBER).pack(anchor="w")
+        tk.Label(card, text=f"avg {cat_avg:.1f}  ·  {len(data['scores'])} games",
+                 font=(FONT_BODY, 9), bg=CARD_BG, fg=TEXT_MUTED).pack(anchor="w")
+
+    # ── SECTION: Score trend chart ────────────────────────────────────────────
+    section_label(body, "SCORE TREND  (all games, chronological)")
+
+    CHART_W, CHART_H = 700, 180
+    PAD_L, PAD_R, PAD_T, PAD_B = 48, 16, 16, 32
+
+    chart_frame = tk.Frame(body, bg=CARD_BG,
+                           highlightthickness=1, highlightbackground=BORDER)
+    chart_frame.pack(fill=tk.X, pady=(0, 8))
+
+    canvas = tk.Canvas(chart_frame, width=CHART_W, height=CHART_H,
+                       bg=CARD_BG, highlightthickness=0)
+    canvas.pack()
+
+    plot_scores = [g["score"] for g in parsed_games]
+    n = len(plot_scores)
+    lo = min(plot_scores)
+    hi = max(plot_scores)
+    score_range = hi - lo if hi != lo else 1
+
+    def sx(i):
+        return PAD_L + (i / max(n - 1, 1)) * (CHART_W - PAD_L - PAD_R)
+
+    def sy(s):
+        return PAD_T + (1 - (s - lo) / score_range) * (CHART_H - PAD_T - PAD_B)
+
+    # Gridlines + Y labels
+    for val in [lo, (lo + hi) // 2, hi]:
+        y = sy(val)
+        canvas.create_line(PAD_L, y, CHART_W - PAD_R, y,
+                           fill=BORDER, dash=(4, 4))
+        canvas.create_text(PAD_L - 6, y, text=str(val),
+                           font=(FONT_BODY, 8), fill=TEXT_MUTED, anchor="e")
+
+    # Average line
+    avg_y = sy(overall_avg)
+    canvas.create_line(PAD_L, avg_y, CHART_W - PAD_R, avg_y,
+                       fill=AMBER, dash=(6, 3), width=1)
+    canvas.create_text(CHART_W - PAD_R + 2, avg_y,
+                       text=f"avg", font=(FONT_BODY, 7), fill=AMBER, anchor="w")
+
+    # Score line
+    if n > 1:
+        points = [(sx(i), sy(s)) for i, s in enumerate(plot_scores)]
+        flat = [coord for pt in points for coord in pt]
+        canvas.create_line(*flat, fill=NAVY, width=2, smooth=True)
+
+    # Dots + hover tooltip
+    dot_ids = []
+    tooltip_label = tk.Label(chart_frame, font=(FONT_BODY, 9, "bold"),
+                              bg=NAVY, fg=WHITE, padx=6, pady=3, relief="flat")
+
+    def make_hover(i, x, y, score, gdate):
+        def enter(e):
+            tooltip_label.config(text=f"{score}  {gdate}")
+            tx = min(x + 8, CHART_W - 80)
+            ty = max(y - 22, 4)
+            tooltip_label.place(x=tx, y=ty)
+        def leave(e):
+            tooltip_label.place_forget()
+        return enter, leave
+
+    for i, (score_val, game) in enumerate(zip(plot_scores, parsed_games)):
+        x, y = sx(i), sy(score_val)
+        color = GREEN if score_val >= overall_avg else RED
+        dot = canvas.create_oval(x - 4, y - 4, x + 4, y + 4,
+                                  fill=color, outline=CARD_BG, width=1)
+        enter_cb, leave_cb = make_hover(i, x, y, score_val, game["date_str"])
+        canvas.tag_bind(dot, "<Enter>", enter_cb)
+        canvas.tag_bind(dot, "<Leave>", leave_cb)
+        dot_ids.append(dot)
+
+    # X-axis labels: first, last, and a few in between
+    label_indices = sorted(set([0, n - 1] + [n // 4, n // 2, 3 * n // 4]))
+    for i in label_indices:
+        if 0 <= i < n:
+            canvas.create_text(sx(i), CHART_H - PAD_B + 10,
+                               text=parsed_games[i]["date_str"],
+                               font=(FONT_BODY, 7), fill=TEXT_MUTED, angle=0)
+
+    # Legend
+    legend = tk.Frame(body, bg=OFFWHITE)
+    legend.pack(anchor="w", pady=(2, 10))
+    for color, label in [(GREEN, "At/above avg"), (RED, "Below avg"), (AMBER, "Your average")]:
+        dot_lbl = tk.Frame(legend, bg=color, width=10, height=10)
+        dot_lbl.pack(side=tk.LEFT, padx=(0, 4))
+        tk.Label(legend, text=label, font=(FONT_BODY, 9),
+                 bg=OFFWHITE, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 16))
+
+    ins.update_idletasks()
+    w = ins.winfo_reqwidth()
+    h = ins.winfo_reqheight()
+    ins.geometry(f"{max(w, 760)}x{min(h, 860)}")
+
+
 # ---------- SHUTDOWN ----------
 
 def on_close():
@@ -644,7 +940,7 @@ def style_dropdown(menu):
 
 window = tk.Tk()
 window.title("Bowling Tracker")
-window.geometry("980x620")
+window.geometry("980x680")
 window.resizable(False, False)
 window.protocol("WM_DELETE_WINDOW", on_close)
 window.configure(bg=OFFWHITE)
@@ -755,32 +1051,88 @@ history_card = tk.Frame(window, bg=CARD_BG,
                         highlightthickness=1, highlightbackground=BORDER)
 history_card.pack(fill=tk.BOTH, expand=True, padx=20, pady=(12, 0))
 
-# History header row
-hist_hdr = tk.Frame(history_card, bg=CARD_BG, pady=10, padx=18)
+# ── History header: ROW 1 — title + Category + Center filters ────────────────
+hist_hdr = tk.Frame(history_card, bg=CARD_BG, pady=8, padx=18)
 hist_hdr.pack(fill=tk.X)
 
 tk.Label(hist_hdr, text="GAME HISTORY", font=(FONT_BODY, 9, "bold"),
          bg=CARD_BG, fg=TEXT_MUTED).pack(side=tk.LEFT)
 
-# Filters on the right side of the header
-filter_area = tk.Frame(hist_hdr, bg=CARD_BG)
-filter_area.pack(side=tk.RIGHT)
+filter_row1 = tk.Frame(hist_hdr, bg=CARD_BG)
+filter_row1.pack(side=tk.RIGHT)
 
-tk.Label(filter_area, text="Category:", font=(FONT_BODY, 10, "bold"),
+tk.Label(filter_row1, text="Category:", font=(FONT_BODY, 10, "bold"),
          bg=CARD_BG, fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
 category_filter_var = tk.StringVar(value="All")
-cat_filter_menu = style_dropdown(tk.OptionMenu(filter_area, category_filter_var, *CATEGORIES))
+cat_filter_menu = style_dropdown(tk.OptionMenu(filter_row1, category_filter_var, *CATEGORIES))
 cat_filter_menu.pack(side=tk.LEFT, padx=(0, 16))
 category_filter_var.trace("w", lambda *args: update_history_display())
 
-tk.Label(filter_area, text="Center:", font=(FONT_BODY, 10, "bold"),
+tk.Label(filter_row1, text="Center:", font=(FONT_BODY, 10, "bold"),
          bg=CARD_BG, fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
 center_filter_var = tk.StringVar(value="All")
-center_filter_menu = ttk.Combobox(filter_area, textvariable=center_filter_var,
-                                   state="readonly", font=(FONT_BODY, 11), width=20)
+center_filter_menu = ttk.Combobox(filter_row1, textvariable=center_filter_var,
+                                   state="readonly", font=(FONT_BODY, 11), width=18)
 center_filter_menu["values"] = ["All"]
 center_filter_menu.pack(side=tk.LEFT)
 center_filter_menu.bind("<<ComboboxSelected>>", lambda event: update_history_display())
+
+# ── History header: ROW 2 — time frame filters ────────────────────────────────
+QUICK_PICKS = [
+    "All Time", "Today", "This Week", "Last 30 Days",
+    "This Year", "Last Year",
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+filter_row2 = tk.Frame(history_card, bg="#F8FAFC",
+                        highlightthickness=1, highlightbackground=BORDER,
+                        pady=7, padx=18)
+filter_row2.pack(fill=tk.X)
+
+tk.Label(filter_row2, text="TIME FRAME", font=(FONT_BODY, 8, "bold"),
+         bg="#F8FAFC", fg=TEXT_MUTED).pack(side=tk.LEFT, padx=(0, 10))
+
+time_quick_var = tk.StringVar(value="All Time")
+quick_menu = style_dropdown(tk.OptionMenu(filter_row2, time_quick_var, *QUICK_PICKS))
+quick_menu.config(width=12)
+quick_menu.pack(side=tk.LEFT, padx=(0, 20))
+time_quick_var.trace("w", apply_quick_pick)
+
+# Divider
+tk.Frame(filter_row2, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16), pady=2)
+
+tk.Label(filter_row2, text="From:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
+date_from_entry = tk.Entry(filter_row2, font=(FONT_BODY, 11), width=12,
+                            bg=ENTRY_BG, relief="flat",
+                            highlightthickness=1, highlightbackground=BORDER,
+                            highlightcolor=AMBER)
+date_from_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, 14))
+
+tk.Label(filter_row2, text="To:", font=(FONT_BODY, 10, "bold"),
+         bg="#F8FAFC", fg=TEXT).pack(side=tk.LEFT, padx=(0, 6))
+date_to_entry = tk.Entry(filter_row2, font=(FONT_BODY, 11), width=12,
+                          bg=ENTRY_BG, relief="flat",
+                          highlightthickness=1, highlightbackground=BORDER,
+                          highlightcolor=AMBER)
+date_to_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, 14))
+
+def on_date_entry_change(event):
+    # Clear the quick pick label when the user types custom dates
+    time_quick_var.set("Custom")
+    update_history_display()
+
+date_from_entry.bind("<Return>", on_date_entry_change)
+date_from_entry.bind("<FocusOut>", on_date_entry_change)
+date_to_entry.bind("<Return>", on_date_entry_change)
+date_to_entry.bind("<FocusOut>", on_date_entry_change)
+
+def clear_time_filter():
+    time_quick_var.set("All Time")  # triggers apply_quick_pick which clears entries + refreshes
+
+clear_btn = make_button(filter_row2, "Clear", clear_time_filter)
+clear_btn.pack(side=tk.LEFT)
 
 # Column header strip
 col_hdr = tk.Frame(history_card, bg="#EFF4FB", pady=5)
@@ -821,7 +1173,8 @@ action_bar.pack(fill=tk.X, padx=20, pady=(10, 16))
 
 make_button(action_bar, "✏  Edit Game", edit_game).pack(side=tk.LEFT, padx=(0, 8))
 make_button(action_bar, "📋  Frame Details", show_frame_details).pack(side=tk.LEFT, padx=(0, 8))
-make_button(action_bar, "🗑  Delete Game", delete_game, danger=True).pack(side=tk.LEFT)
+make_button(action_bar, "🗑  Delete Game", delete_game, danger=True).pack(side=tk.LEFT, padx=(0, 8))
+make_button(action_bar, "📊  Insights", show_insights, primary=True).pack(side=tk.RIGHT)
 
 
 # ── BOOT ──────────────────────────────────────────────────────────────────────
