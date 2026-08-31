@@ -37,18 +37,11 @@ def _ensure_balls_table(cursor, connection):
 
 def _app_folder():
     """Directory that contains the application code / data files.
-    Works for:
-      - running as a .py script
-      - running as a frozen executable (PyInstaller one-file or one-folder)
-    """
+    Works for source runs and frozen executables (PyInstaller)."""
     if getattr(sys, "frozen", False):
-        # PyInstaller one-file extracts data into sys._MEIPASS
         if hasattr(sys, "_MEIPASS"):
             return sys._MEIPASS
-        # one-folder / other freezers: data lives next to the executable
         return os.path.dirname(sys.executable)
-
-    # Running from source – use the folder that contains this file
     return os.path.dirname(os.path.realpath(__file__))
 
 
@@ -56,25 +49,17 @@ def _candidate_csv_paths():
     """Every reasonable place the USBC CSV might live."""
     names = ["usbc_approved_balls.csv", "usbc_approved_balls_2.csv"]
     candidates = []
-
-    # 1. Next to arsenal.py (or inside the frozen bundle)
     base = _app_folder()
     for name in names:
         candidates.append(os.path.join(base, name))
-
-    # 2. Next to the script the user actually launched (bowling.py / the .exe)
     try:
         launch_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
         for name in names:
             candidates.append(os.path.join(launch_dir, name))
     except Exception:
         pass
-
-    # 3. Current working directory (fallback)
     for name in names:
         candidates.append(os.path.join(os.getcwd(), name))
-
-    # Remove duplicates while preserving order
     seen = set()
     unique = []
     for p in candidates:
@@ -117,8 +102,7 @@ def _ensure_approved_balls_table(cursor, connection):
         with open(csv_path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             rows = [
-                (row["brand"].strip(), row["ball_name"].strip(),
-                 row.get("date_approved", "").strip())
+                (row["brand"].strip(), row["ball_name"].strip(), row.get("date_approved", "").strip())
                 for row in reader
                 if row.get("brand") and row.get("ball_name")
             ]
@@ -167,22 +151,86 @@ def _parse_frames(frame_data):
         return None
 
 
-def _count_strikes_and_misses(frames):
-    """Return (strike_frames, first_throw_misses, total_frames_counted)
-    from a list of frame dicts."""
+def _names_match(a, b):
+    if not a or not b:
+        return False
+    return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _first_ball_pins(mark):
+    if mark is None:
+        return None
+    m = str(mark).strip().upper()
+    if m == "X":
+        return 10
+    if m in ("-", ""):
+        return 0
+    try:
+        v = int(m)
+        if 0 <= v <= 9:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _count_frame_roles(frames):
+    """Return first-throw, spare-conversion, and leave-size counts from frames.
+
+    Returns:
+        strikes, misses, first_throws, spare_opps, spare_made,
+        first_ball_sum, single_pin_opps, single_pin_made,
+        multi_pin_opps, multi_pin_made
+    """
     strikes = 0
     misses = 0
-    total = 0
-    for i, frame in enumerate(frames[:10]):
+    first_throws = 0
+    spare_opps = 0
+    spare_made = 0
+    first_ball_sum = 0
+    single_pin_opps = 0
+    single_pin_made = 0
+    multi_pin_opps = 0
+    multi_pin_made = 0
+    for frame in frames[:10]:
         throws = frame.get("throws", [])
         if not throws:
             continue
-        total += 1
-        first = throws[0].strip().upper()
-        if first == "X":
+        first_mark = str(throws[0]).strip().upper()
+        first_pins = _first_ball_pins(throws[0])
+        first_throws += 1
+        if first_pins is not None:
+            first_ball_sum += first_pins
+        if first_mark == "X":
             strikes += 1
-        elif first in ("-", "0"):
+            continue
+        if first_mark in ("-", "0"):
             misses += 1
+        spare_opps += 1
+        converted = len(throws) >= 2 and str(throws[1]).strip().upper() == "/"
+        if converted:
+            spare_made += 1
+        if first_pins is not None and first_pins < 10:
+            left = 10 - first_pins
+            if left == 1:
+                single_pin_opps += 1
+                if converted:
+                    single_pin_made += 1
+            elif left >= 2:
+                multi_pin_opps += 1
+                if converted:
+                    multi_pin_made += 1
+    return (
+        strikes, misses, first_throws, spare_opps, spare_made,
+        first_ball_sum, single_pin_opps, single_pin_made,
+        multi_pin_opps, multi_pin_made,
+    )
+
+
+def _count_strikes_and_misses(frames):
+    """Return (strike_frames, first_throw_misses, total_frames_counted)
+    from a list of frame dicts."""
+    strikes, misses, total, *_ = _count_frame_roles(frames)
     return strikes, misses, total
 
 
@@ -190,78 +238,129 @@ def _count_strikes_and_misses(frames):
 
 def _compute_ball_stats(ball_name, cursor):
     """Return a dict of stats for ball_name, or None if no games recorded.
+    Counts games where this ball was the strike ball, the spare ball, or both.
     Never raises — any bad/unexpected row data is skipped rather than
     crashing the whole detail panel."""
     try:
-        # Case/whitespace-tolerant match: games logged before the Ball
-        # dropdown existed may have slightly different capitalization or
-        # stray spaces compared to the Arsenal entry's exact name.
-        cursor.execute(
-            "SELECT score, frames FROM games "
-            "WHERE ball IS NOT NULL AND TRIM(LOWER(ball)) = TRIM(LOWER(?))",
-            (ball_name,)
-        )
-        rows = cursor.fetchall()
+        # Case/whitespace-tolerant match. spare_ball may be missing on
+        # very old DBs; fall back to strike-ball-only in that case.
+        try:
+            cursor.execute(
+                "SELECT score, frames, ball, spare_ball FROM games "
+                "WHERE (ball IS NOT NULL AND TRIM(LOWER(ball)) = TRIM(LOWER(?))) "
+                "   OR (spare_ball IS NOT NULL AND TRIM(LOWER(spare_ball)) = TRIM(LOWER(?)))",
+                (ball_name, ball_name)
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            cursor.execute(
+                "SELECT score, frames, ball FROM games "
+                "WHERE ball IS NOT NULL AND TRIM(LOWER(ball)) = TRIM(LOWER(?))",
+                (ball_name,)
+            )
+            rows = [(score, frames, ball, None) for score, frames, ball in cursor.fetchall()]
     except Exception:
         return None
 
     if not rows:
         return None
 
-    # Filter out any row whose score isn't a usable number instead of
-    # letting one bad/legacy row crash the whole stats panel.
-    scores = []
-    frame_rows = []
-    for score, frame_data in rows:
-        try:
-            scores.append(int(score))
-            frame_rows.append(frame_data)
-        except (TypeError, ValueError):
-            continue
-
-    if not scores:
-        return None
-
-    games = len(scores)
-    avg = sum(scores) / games
-    high = max(scores)
-    # Total pins: sum of all scores (each score already represents pins knocked
-    # down across 10 frames in standard scoring, which is the conventional
-    # "total pins" metric used by bowling centers and apps).
-    total_pins = sum(scores)
-
-    # Frame-level stats
+    strike_scores = []
+    appearance_scores = []
+    games_as_strike = 0
+    games_as_spare = 0
+    games_with_frames = 0
     total_strike_frames = 0
     total_miss_frames = 0
-    total_frames = 0
-    games_with_frames = 0
+    total_first_throws = 0
+    total_spare_opps = 0
+    total_spare_made = 0
+    total_first_ball_sum = 0
+    total_single_opps = 0
+    total_single_made = 0
+    total_multi_opps = 0
+    total_multi_made = 0
+    frame_games_as_strike = 0
+    frame_games_as_spare = 0
 
-    for frame_data in frame_rows:
+    for row in rows:
+        try:
+            score = int(row[0])
+            frame_data = row[1]
+            game_ball = row[2]
+            game_spare = row[3] if len(row) > 3 else None
+        except (TypeError, ValueError, IndexError):
+            continue
+
+        as_strike = _names_match(game_ball, ball_name)
+        as_spare = _names_match(game_spare, ball_name)
+        single_ball = as_strike and not game_spare
+
+        appearance_scores.append(score)
+        if as_strike:
+            games_as_strike += 1
+            strike_scores.append(score)
+        if as_spare:
+            games_as_spare += 1
+
         frames = _parse_frames(frame_data)
         if frames is None:
             continue
         games_with_frames += 1
         try:
-            s, m, t = _count_strikes_and_misses(frames)
-        except (AttributeError, TypeError):
-            # Malformed frame JSON (e.g. from an older import format) —
-            # skip its frame-level contribution rather than crashing.
+            (s, m, t, opps, made, fb_sum,
+             s_opps, s_made, m_opps, m_made) = _count_frame_roles(frames)
+        except (AttributeError, TypeError, ValueError):
             continue
-        total_strike_frames += s
-        total_miss_frames += m
-        total_frames += t
 
-    result = {
+        # Strike-ball (or one-ball) games: first-throw stats
+        if as_strike:
+            frame_games_as_strike += 1
+            total_strike_frames += s
+            total_miss_frames += m
+            total_first_throws += t
+            total_first_ball_sum += fb_sum
+        # Spare-ball games, or one-ball games: spare conversion
+        if as_spare or single_ball:
+            frame_games_as_spare += 1
+            total_spare_opps += opps
+            total_spare_made += made
+            total_single_opps += s_opps
+            total_single_made += s_made
+            total_multi_opps += m_opps
+            total_multi_made += m_made
+
+    if not appearance_scores:
+        return None
+
+    pin_scores = strike_scores if strike_scores else appearance_scores
+    games = len(appearance_scores)
+    avg = sum(pin_scores) / len(pin_scores)
+    high = max(pin_scores)
+    total_pins = sum(pin_scores)
+
+    return {
         "games": games,
+        "games_as_strike": games_as_strike,
+        "games_as_spare": games_as_spare,
         "avg": avg,
         "high": high,
         "total_pins": total_pins,
+        "avg_from_strike": bool(strike_scores),
         "games_with_frames": games_with_frames,
-        "total_frames": total_frames,
+        "frame_games_as_strike": frame_games_as_strike,
+        "frame_games_as_spare": frame_games_as_spare,
+        "total_frames": total_first_throws,
         "strike_frames": total_strike_frames,
         "miss_frames": total_miss_frames,
+        "spare_opps": total_spare_opps,
+        "spare_made": total_spare_made,
+        "first_ball_sum": total_first_ball_sum,
+        "single_pin_opps": total_single_opps,
+        "single_pin_made": total_single_made,
+        "multi_pin_opps": total_multi_opps,
+        "multi_pin_made": total_multi_made,
     }
-    return result
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -287,6 +386,18 @@ def show_arsenal(parent_window, connection, cursor, tokens):
     ENTRY_BG  = tokens["ENTRY_BG"]
     FONT_BODY = tokens["FONT_BODY"]
     FONT_MONO = tokens["FONT_MONO"]
+
+    # Native tk.Button ignores custom colors on some platforms (notably
+    # macOS), which is why buttons stayed white regardless of theme. This
+    # Label-based flat button reliably respects bg/fg everywhere.
+    def _flat_btn(parent, text, cmd, bg, fg, abg, font=(FONT_BODY, 11, "bold"),
+                  padx=16, pady=7):
+        b = tk.Label(parent, text=text, font=font, bg=bg, fg=fg,
+                     padx=padx, pady=pady, cursor="hand2", borderwidth=0)
+        b.bind("<Enter>", lambda e: b.configure(bg=abg))
+        b.bind("<Leave>", lambda e: b.configure(bg=bg))
+        b.bind("<Button-1>", lambda e: cmd())
+        return b
 
     # ── Window ────────────────────────────────────────────────────────────────
     win = tk.Toplevel(parent_window)
@@ -521,7 +632,7 @@ def show_arsenal(parent_window, connection, cursor, tokens):
             no_stats.pack(fill=tk.X, **pad)
             tk.Label(no_stats,
                      text="No games recorded with this ball yet.\n"
-                          "Add games and set the Ball field to see stats here.",
+                          "Add games and set Strike Ball or Spare Ball to see stats here.",
                      font=(FONT_BODY, 10), bg=CARD_BG, fg=TEXT_MUTED,
                      justify=tk.LEFT).pack(padx=14, pady=14, anchor="w")
         else:
@@ -549,13 +660,24 @@ def show_arsenal(parent_window, connection, cursor, tokens):
                              bg=NAVY if highlight else CARD_BG,
                              fg="#5B7FA6" if highlight else TEXT_MUTED).pack()
 
-            stat_tile(tiles_frame, "TOTAL PINS", f"{stats['total_pins']:,}", highlight=True)
-            stat_tile(tiles_frame, "GAMES", stats["games"])
-            stat_tile(tiles_frame, "AVG SCORE", f"{stats['avg']:.1f}")
-            stat_tile(tiles_frame, "HIGH GAME", stats["high"])
+            role_bits = []
+            if stats["games_as_strike"]:
+                role_bits.append(f"{stats['games_as_strike']} strike")
+            if stats["games_as_spare"]:
+                role_bits.append(f"{stats['games_as_spare']} spare")
+            role_sub = " · ".join(role_bits) if role_bits else None
+            avg_sub = "as strike ball" if stats["avg_from_strike"] else "games this ball was in"
+
+            stat_tile(tiles_frame, "TOTAL PINS", f"{stats['total_pins']:,}",
+                      sub=avg_sub, highlight=True)
+            stat_tile(tiles_frame, "GAMES", stats["games"], sub=role_sub)
+            stat_tile(tiles_frame, "AVG SCORE", f"{stats['avg']:.1f}", sub=avg_sub)
+            stat_tile(tiles_frame, "HIGH GAME", stats["high"], sub=avg_sub)
 
             # ── Frame-level stats (only if frame data exists) ──
-            if stats["games_with_frames"] > 0 and stats["total_frames"] > 0:
+            show_strike_frames = stats["total_frames"] > 0
+            show_spare_frames = stats["spare_opps"] > 0
+            if show_strike_frames or show_spare_frames:
                 section_label(
                     f"FRAME STATS  "
                     f"({stats['games_with_frames']} of {stats['games']} games have frame data)"
@@ -568,15 +690,15 @@ def show_arsenal(parent_window, connection, cursor, tokens):
                     pct = (numerator / denominator * 100) if denominator else 0
                     card = tk.Frame(parent, bg=CARD_BG,
                                    highlightthickness=1, highlightbackground=BORDER,
-                                   padx=20, pady=14)
-                    card.pack(side=tk.LEFT, padx=(0, 10))
+                                   padx=16, pady=12)
+                    card.pack(side=tk.LEFT, padx=(0, 8))
                     tk.Label(card, text=f"{pct:.1f}%",
-                             font=(FONT_BODY, 26, "bold"),
+                             font=(FONT_BODY, 24, "bold"),
                              bg=CARD_BG, fg=color).pack()
                     tk.Label(card, text=label,
-                             font=(FONT_BODY, 9, "bold"),
+                             font=(FONT_BODY, 8, "bold"),
                              bg=CARD_BG, fg=TEXT_MUTED).pack()
-                    tk.Label(card, text=f"{numerator} / {denominator} frames",
+                    tk.Label(card, text=f"{numerator} / {denominator}",
                              font=(FONT_BODY, 8),
                              bg=CARD_BG, fg=TEXT_MUTED).pack()
                     if note:
@@ -584,23 +706,62 @@ def show_arsenal(parent_window, connection, cursor, tokens):
                                  font=(FONT_BODY, 7),
                                  bg=CARD_BG, fg=TEXT_MUTED).pack()
 
-                tf = stats["total_frames"]
-                pct_tile(pct_row, "STRIKE RATE",
-                         stats["strike_frames"], tf, AMBER)
+                if show_strike_frames:
+                    tf = stats["total_frames"]
+                    pct_tile(pct_row, "STRIKE RATE",
+                             stats["strike_frames"], tf, AMBER,
+                             note="first ball (strike role)")
+                    pct_tile(pct_row, "1ST-THROW MISS",
+                             stats["miss_frames"], tf, RED,
+                             note="gutter / zero on 1st")
+                    if tf > 0:
+                        fb_avg = stats["first_ball_sum"] / tf
+                        fb_card = tk.Frame(pct_row, bg=CARD_BG,
+                                           highlightthickness=1, highlightbackground=BORDER,
+                                           padx=16, pady=12)
+                        fb_card.pack(side=tk.LEFT, padx=(0, 8))
+                        tk.Label(fb_card, text=f"{fb_avg:.2f}",
+                                 font=(FONT_BODY, 24, "bold"),
+                                 bg=CARD_BG, fg=TEXT).pack()
+                        tk.Label(fb_card, text="FIRST-BALL AVG",
+                                 font=(FONT_BODY, 8, "bold"),
+                                 bg=CARD_BG, fg=TEXT_MUTED).pack()
+                        tk.Label(fb_card, text=f"{tf} first shots",
+                                 font=(FONT_BODY, 8),
+                                 bg=CARD_BG, fg=TEXT_MUTED).pack()
 
-                spare_opps = tf - stats["strike_frames"]
-                pct_tile(pct_row, "FIRST-THROW MISS RATE",
-                         stats["miss_frames"], tf, RED,
-                         note="(gutter ball or no pins on 1st ball)")
+                if show_spare_frames:
+                    pct_row2 = tk.Frame(inner, bg=OFFWHITE)
+                    pct_row2.pack(fill=tk.X, padx=18, pady=(8, 0))
+                    pct_tile(pct_row2, "SPARE CONVERSION",
+                             stats["spare_made"], stats["spare_opps"], GREEN,
+                             note="spare role / one-ball")
+                    if stats["single_pin_opps"] > 0:
+                        pct_tile(pct_row2, "SINGLE-PIN",
+                                 stats["single_pin_made"], stats["single_pin_opps"], GREEN,
+                                 note="1 pin standing")
+                    if stats["multi_pin_opps"] > 0:
+                        pct_tile(pct_row2, "MULTI-PIN",
+                                 stats["multi_pin_made"], stats["multi_pin_opps"], AMBER,
+                                 note="2+ pins standing")
 
             # ── Score mini-chart (sparkline) ──
             try:
-                cursor.execute(
-                    "SELECT date, score FROM games "
-                    "WHERE ball IS NOT NULL AND TRIM(LOWER(ball)) = TRIM(LOWER(?)) "
-                    "ORDER BY date",
-                    (name,)
-                )
+                try:
+                    cursor.execute(
+                        "SELECT date, score FROM games "
+                        "WHERE (ball IS NOT NULL AND TRIM(LOWER(ball)) = TRIM(LOWER(?))) "
+                        "   OR (spare_ball IS NOT NULL AND TRIM(LOWER(spare_ball)) = TRIM(LOWER(?))) "
+                        "ORDER BY date",
+                        (name, name)
+                    )
+                except Exception:
+                    cursor.execute(
+                        "SELECT date, score FROM games "
+                        "WHERE ball IS NOT NULL AND TRIM(LOWER(ball)) = TRIM(LOWER(?)) "
+                        "ORDER BY date",
+                        (name,)
+                    )
                 raw_score_rows = cursor.fetchall()
                 score_rows = []
                 for d, s in raw_score_rows:
@@ -685,12 +846,8 @@ def show_arsenal(parent_window, connection, cursor, tokens):
             elif danger:
                 bg, fg, abg = "#DC2626", WHITE, "#B91C1C"
             else:
-                bg, fg, abg = "#E2EAF3", TEXT, "#C7D5E8"
-            b = tk.Button(parent, text=text, command=cmd,
-                          font=(FONT_BODY, 11, "bold"),
-                          bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
-                          relief="flat", cursor="hand2", padx=16, pady=7, borderwidth=0)
-            return b
+                bg, fg, abg = ENTRY_BG, TEXT, BORDER
+            return _flat_btn(parent, text, cmd, bg, fg, abg)
 
         _btn(action_strip, "✏  Edit Ball", lambda: open_edit_dialog(ball_id)).pack(side=tk.LEFT, padx=(0, 8))
         _btn(action_strip, "🗑  Delete Ball", lambda: delete_ball(ball_id), danger=True).pack(side=tk.LEFT)
@@ -845,12 +1002,8 @@ def show_arsenal(parent_window, connection, cursor, tokens):
             if primary:
                 bg, fg, abg = AMBER, NAVY, "#D97706"
             else:
-                bg, fg, abg = "#E2EAF3", TEXT, "#C7D5E8"
-            b = tk.Button(parent, text=text, command=cmd,
-                          font=(FONT_BODY, 11, "bold"),
-                          bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
-                          relief="flat", cursor="hand2", padx=16, pady=7, borderwidth=0)
-            return b
+                bg, fg, abg = ENTRY_BG, TEXT, BORDER
+            return _flat_btn(parent, text, cmd, bg, fg, abg)
 
         _dlg_btn(btn_row_dlg, "Save", save, primary=True).pack(side=tk.LEFT, padx=(0, 8))
         _dlg_btn(btn_row_dlg, "Cancel", dlg.destroy).pack(side=tk.LEFT)
@@ -926,13 +1079,7 @@ def show_arsenal(parent_window, connection, cursor, tokens):
             kind = approved_balls_status.split(":", 1)[0]
             detail = approved_balls_status.split(":", 1)[1] if ":" in approved_balls_status else ""
             if kind == "missing_csv":
-                # detail may be "searched:\n<path1>\n<path2>..." or a single path
-                msg = (
-                    "Couldn't find usbc_approved_balls.csv.\n\n"
-                    f"{detail.strip()}\n\n"
-                    "Put the CSV in the same folder as bowling.py / arsenal.py "
-                    "and reopen the Arsenal window."
-                )
+                msg = f"Couldn't find usbc_approved_balls.csv.\nExpected it at:\n{detail}\n\nPut the CSV in that folder and reopen the Arsenal window."
             elif kind == "empty_csv":
                 msg = f"usbc_approved_balls.csv was found but has no rows:\n{detail}"
             elif kind == "import_failed":
@@ -1002,12 +1149,8 @@ def show_arsenal(parent_window, connection, cursor, tokens):
             if primary:
                 bg, fg, abg = AMBER, NAVY, "#D97706"
             else:
-                bg, fg, abg = "#E2EAF3", TEXT, "#C7D5E8"
-            b = tk.Button(parent, text=text, command=cmd,
-                          font=(FONT_BODY, 11, "bold"),
-                          bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
-                          relief="flat", cursor="hand2", padx=16, pady=7, borderwidth=0)
-            return b
+                bg, fg, abg = ENTRY_BG, TEXT, BORDER
+            return _flat_btn(parent, text, cmd, bg, fg, abg)
 
         _pick_btn(btn_row_pick, "Add to Arsenal", add_selected, primary=True).pack(
             side=tk.LEFT, padx=(0, 8))
@@ -1020,12 +1163,9 @@ def show_arsenal(parent_window, connection, cursor, tokens):
         if primary:
             bg, fg, abg = AMBER, NAVY, "#D97706"
         else:
-            bg, fg, abg = "#E2EAF3", TEXT, "#C7D5E8"
-        b = tk.Button(parent, text=text, command=cmd,
-                      font=(FONT_BODY, 10, "bold"),
-                      bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
-                      relief="flat", cursor="hand2", padx=10, pady=5, borderwidth=0)
-        return b
+            bg, fg, abg = ENTRY_BG, TEXT, BORDER
+        return _flat_btn(parent, text, cmd, bg, fg, abg, font=(FONT_BODY, 10, "bold"),
+                         padx=10, pady=5)
 
     _small_btn(roster_btn_row, "+ Add Ball", open_add_dialog, primary=True).pack(
         side=tk.LEFT, padx=(0, 6))
