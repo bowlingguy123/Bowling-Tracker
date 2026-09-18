@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 import calendar
 import statistics
 import math
+from typing import Optional, Tuple, List, Any 
 from scoresheet_importer import read_scoresheet
 from arsenal import show_arsenal, _ensure_balls_table
 
@@ -75,13 +76,25 @@ sort_ascending = True
 
 # ---------- SETTINGS (defined early so the theme can be picked before widgets build) ----------
 
-def get_setting(key, default=None):
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
-        cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        cursor.execute("SELECT value FROM app_settings WHERE key = ?", (str(key),))
         row = cursor.fetchone()
-        return row[0] if row else default
+        return str(row[0]) if row else default
     except sqlite3.Error:
         return default
+
+
+def set_setting(key: str, value: Any) -> None:
+    try:
+        cursor.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(key), str(value)),
+        )
+        connection.commit()
+    except sqlite3.Error:
+        pass
 
 
 def set_setting(key, value):
@@ -177,22 +190,32 @@ NO_BALL_LABEL = "— No Ball —"
 NO_SPARE_LABEL = "— No Spare Ball —"
 
 
-def combo_ball(value):
+def combo_ball(value: Optional[str]) -> Optional[str]:
     """Turn a dropdown value into a stored ball name, or None."""
-    v = (value or "").strip()
+    if value is None:
+        return None
+    v: str = str(value).strip()
     if not v or v in (NO_BALL_LABEL, NO_SPARE_LABEL):
         return None
     return v
 
 
-def pair_balls(strike_value, spare_value):
+def pair_balls(strike_value: Optional[str], spare_value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """Return (strike_ball, spare_ball). Same ball twice is stored as strike-only."""
-    strike = combo_ball(strike_value)
-    spare = combo_ball(spare_value)
+    strike: Optional[str] = combo_ball(strike_value)
+    spare: Optional[str] = combo_ball(spare_value)
     if strike and spare and strike.lower() == spare.lower():
         spare = None
     return strike, spare
 
+
+def format_balls_display(strike: Optional[str], spare: Optional[str]) -> str:
+    """Format the ball names for the UI list."""
+    str_strike = strike or ""
+    str_spare = spare or ""
+    if str_strike and str_spare:
+        return f"{str_strike} / {str_spare}"
+    return str_strike or str_spare or ""
 
 def format_balls_display(strike, spare):
     strike = strike or ""
@@ -201,12 +224,11 @@ def format_balls_display(strike, spare):
         return f"{strike} / {spare}"
     return strike or spare or ""
 
-
-def get_arsenal_ball_names():
+def get_arsenal_ball_names() -> List[str]:
     """Ball names from the Arsenal (balls table), alphabetical."""
     try:
         cursor.execute("SELECT name FROM balls ORDER BY name")
-        return [row[0] for row in cursor.fetchall()]
+        return [str(row[0]) for row in cursor.fetchall()]
     except sqlite3.Error:
         return []
 
@@ -2616,29 +2638,82 @@ def show_insights(parent):
 
 # ---------- EXPORT / BACKUP ----------
 
-def export_to_csv():
-    file_path = filedialog.asksaveasfilename(
-        title="Export Game History",
-        defaultextension=".csv",
-        filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        initialfile="bowling_history.csv",
-    )
-    if not file_path:
+BACKUP_FOLDER = os.path.join(APP_FOLDER, "backups")
+
+
+def _get_backup_retention():
+    """Return the user-configured number of auto-backups to keep (default 5)."""
+    try:
+        return max(1, int(get_setting("backup_retention", "5")))
+    except (ValueError, TypeError):
+        return 5
+
+
+def _prune_old_backups(folder, keep):
+    """Delete the oldest auto-backups, keeping only the most recent `keep` files."""
+    try:
+        files = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.startswith("auto_backup_") and f.endswith(".db")
+        ]
+        files.sort(key=os.path.getmtime)
+        for old_file in files[:-keep]:
+            try:
+                os.remove(old_file)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def run_auto_backup():
+    """Silently copy bowling.db into the backups/ folder on launch.
+    Only runs if auto_backup_enabled == '1'. Prunes old backups after."""
+    if get_setting("auto_backup_enabled", "0") != "1":
         return
+    try:
+        os.makedirs(BACKUP_FOLDER, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(BACKUP_FOLDER, f"auto_backup_{timestamp}.db")
+        connection.commit()
+        shutil.copy2(os.path.join(APP_FOLDER, "bowling.db"), dest)
+        _prune_old_backups(BACKUP_FOLDER, _get_backup_retention())
+    except OSError:
+        pass  # Silently fail — auto-backup should never block the app from opening
+
+
+def export_to_csv(path=None, silent=False):
+    """Export game history to CSV.
+
+    path   — if provided, skip the file dialog and write directly there.
+    silent — if True, skip success/failure dialogs (used for auto-export).
+    """
+    if path is None:
+        path = filedialog.asksaveasfilename(
+            title="Export Game History",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="bowling_history.csv",
+        )
+    if not path:
+        return False
 
     try:
         cursor.execute("SELECT date, score, category, center, ball, spare_ball FROM games ORDER BY date")
         rows = cursor.fetchall()
     except sqlite3.Error as error:
-        messagebox.showerror("Database Error", f"Could not load games:\n{error}")
-        return
+        if not silent:
+            messagebox.showerror("Database Error", f"Could not load games:\n{error}")
+        return False
 
     if not rows:
-        messagebox.showinfo("Nothing to Export", "There are no games in the tracker yet.")
-        return
+        if not silent:
+            messagebox.showinfo("Nothing to Export", "There are no games in the tracker yet.")
+        return False
 
     try:
-        with open(file_path, "w", newline="", encoding="utf-8") as csv_file:
+        with open(path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(["Date", "Score", "Category", "Center", "Strike Ball", "Spare Ball"])
             for game_date, score, category, center, ball, spare_ball in rows:
@@ -2647,10 +2722,29 @@ def export_to_csv():
                     ball or "", spare_ball or "",
                 ])
     except OSError as error:
-        messagebox.showerror("Export Failed", f"Could not write the CSV file:\n{error}")
-        return
+        if not silent:
+            messagebox.showerror("Export Failed", f"Could not write the CSV file:\n{error}")
+        return False
 
-    messagebox.showinfo("Export Complete", f"Exported {len(rows)} game(s) to:\n{file_path}")
+    if not silent:
+        messagebox.showinfo("Export Complete", f"Exported {len(rows)} game(s) to:\n{path}")
+    return True
+
+
+def _get_auto_export_path():
+    """Return the configured auto-export CSV path, or None if not set."""
+    p = get_setting("auto_export_path", "")
+    return p.strip() if p and p.strip() else None
+
+
+def run_auto_export():
+    """Write the CSV to the configured path silently (called on close)."""
+    if get_setting("auto_export_enabled", "0") != "1":
+        return
+    path = _get_auto_export_path()
+    if not path:
+        return
+    export_to_csv(path=path, silent=True)
 
 
 def backup_database():
@@ -2672,6 +2766,167 @@ def backup_database():
         return
 
     messagebox.showinfo("Backup Complete", f"Database backed up to:\n{file_path}")
+
+
+def open_backup_settings():
+    """Settings dialog for auto-backup and auto-export."""
+    dlg = tk.Toplevel(window)
+    dlg.title("Backup & Data Settings")
+    dlg.configure(bg=OFFWHITE)
+    dlg.resizable(False, False)
+    dlg.transient(window)
+    dlg.grab_set()
+
+    hdr = tk.Frame(dlg, bg=NAVY)
+    hdr.pack(fill=tk.X)
+    tk.Label(hdr, text="💾  Backup & Data", font=(FONT_BODY, 15, "bold"),
+             bg=NAVY, fg=WHITE).pack(side=tk.LEFT, padx=20, pady=14)
+
+    body = tk.Frame(dlg, bg=OFFWHITE, padx=28, pady=20)
+    body.pack(fill=tk.BOTH)
+
+    def section_label(text):
+        tk.Label(body, text=text, font=(FONT_BODY, 11, "bold"),
+                 bg=OFFWHITE, fg=TEXT).pack(anchor="w", pady=(18, 4))
+
+    def muted_label(text):
+        tk.Label(body, text=text, font=(FONT_BODY, 9),
+                 bg=OFFWHITE, fg=TEXT_MUTED, justify=tk.LEFT).pack(anchor="w", pady=(0, 6))
+
+    def entry_style(width=32):
+        return dict(font=(FONT_BODY, 11), width=width, bg=ENTRY_BG, relief="flat",
+                    highlightthickness=1, highlightbackground=BORDER, highlightcolor=AMBER)
+
+    # ── Auto-backup ──────────────────────────────────────────────────────────
+    section_label("Auto-backup on launch")
+    muted_label(
+        f"Silently copies the database to a backups/ folder inside the app folder\n"
+        f"every time Bowling Tracker opens. Old backups are pruned automatically."
+    )
+
+    auto_backup_var = tk.BooleanVar(value=get_setting("auto_backup_enabled", "0") == "1")
+    tk.Checkbutton(
+        body, text="Enable auto-backup on launch",
+        variable=auto_backup_var,
+        font=(FONT_BODY, 11), bg=OFFWHITE, fg=TEXT,
+        activebackground=OFFWHITE, selectcolor=ENTRY_BG,
+    ).pack(anchor="w")
+
+    retention_row = tk.Frame(body, bg=OFFWHITE)
+    retention_row.pack(anchor="w", pady=(8, 0))
+    tk.Label(retention_row, text="Keep the last", font=(FONT_BODY, 11),
+             bg=OFFWHITE, fg=TEXT).pack(side=tk.LEFT, padx=(0, 8))
+    retention_entry = tk.Entry(retention_row, **entry_style(4))
+    retention_entry.pack(side=tk.LEFT, ipady=4, ipadx=3)
+    retention_entry.insert(0, get_setting("backup_retention", "5"))
+    tk.Label(retention_row, text="backups", font=(FONT_BODY, 11),
+             bg=OFFWHITE, fg=TEXT).pack(side=tk.LEFT, padx=(8, 0))
+
+    # Show the backup folder path for reference
+    tk.Label(body, text=f"Backup folder:  {BACKUP_FOLDER}",
+             font=(FONT_BODY, 9), bg=OFFWHITE, fg=TEXT_MUTED).pack(anchor="w", pady=(6, 0))
+
+    def open_backup_folder():
+        try:
+            os.makedirs(BACKUP_FOLDER, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(BACKUP_FOLDER)
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", BACKUP_FOLDER])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", BACKUP_FOLDER])
+        except Exception as e:
+            messagebox.showwarning("Could Not Open Folder", str(e), parent=dlg)
+
+    make_secondary_button(body, "📂  Open backup folder", open_backup_folder).pack(
+        anchor="w", pady=(6, 0)
+    )
+
+    tk.Frame(body, bg=BORDER, height=1).pack(fill=tk.X, pady=(20, 0))
+
+    # ── Auto-export CSV ──────────────────────────────────────────────────────
+    section_label("Auto-export CSV on close")
+    muted_label(
+        "Writes a CSV of your game history to a fixed file path every time\n"
+        "the app closes. Useful for keeping a spreadsheet automatically in sync."
+    )
+
+    auto_export_var = tk.BooleanVar(value=get_setting("auto_export_enabled", "0") == "1")
+    tk.Checkbutton(
+        body, text="Enable auto-export on close",
+        variable=auto_export_var,
+        font=(FONT_BODY, 11), bg=OFFWHITE, fg=TEXT,
+        activebackground=OFFWHITE, selectcolor=ENTRY_BG,
+    ).pack(anchor="w")
+
+    path_row = tk.Frame(body, bg=OFFWHITE)
+    path_row.pack(fill=tk.X, pady=(8, 0))
+    tk.Label(path_row, text="Save CSV to:", font=(FONT_BODY, 11),
+             bg=OFFWHITE, fg=TEXT).pack(anchor="w")
+
+    path_entry_row = tk.Frame(body, bg=OFFWHITE)
+    path_entry_row.pack(fill=tk.X, pady=(4, 0))
+    export_path_var = tk.StringVar(value=get_setting("auto_export_path", ""))
+    export_path_entry = tk.Entry(path_entry_row, textvariable=export_path_var, **entry_style(34))
+    export_path_entry.pack(side=tk.LEFT, ipady=4, ipadx=3, padx=(0, 8))
+
+    def browse_export_path():
+        chosen = filedialog.asksaveasfilename(
+            parent=dlg,
+            title="Choose auto-export CSV path",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile="bowling_history.csv",
+        )
+        if chosen:
+            export_path_var.set(chosen)
+
+    make_secondary_button(path_entry_row, "Browse…", browse_export_path).pack(side=tk.LEFT)
+
+    tk.Frame(body, bg=BORDER, height=1).pack(fill=tk.X, pady=(20, 0))
+
+    # ── Save ─────────────────────────────────────────────────────────────────
+    def save_backup_settings():
+        # Validate retention count
+        retention_text = retention_entry.get().strip()
+        try:
+            retention = int(retention_text)
+            if retention < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid Value",
+                                   "Backup retention must be a whole number of 1 or more.",
+                                   parent=dlg)
+            return
+
+        # Validate export path if auto-export is enabled
+        export_path = export_path_var.get().strip()
+        if auto_export_var.get() and not export_path:
+            messagebox.showwarning("Missing Path",
+                                   "Please enter or browse to a CSV file path for auto-export.",
+                                   parent=dlg)
+            return
+
+        set_setting("auto_backup_enabled", "1" if auto_backup_var.get() else "0")
+        set_setting("backup_retention", str(retention))
+        set_setting("auto_export_enabled", "1" if auto_export_var.get() else "0")
+        set_setting("auto_export_path", export_path)
+
+        dlg.destroy()
+        messagebox.showinfo("Settings Saved",
+                            "Backup & Data settings saved.\n\n"
+                            + ("Auto-backup will run next time the app opens.\n" if auto_backup_var.get() else "")
+                            + ("Auto-export will run the next time the app closes." if auto_export_var.get() else ""))
+
+    btn_row = tk.Frame(body, bg=OFFWHITE)
+    btn_row.pack(pady=(20, 4))
+    make_button(btn_row, "Save", save_backup_settings, primary=True).pack(side=tk.LEFT, padx=(0, 8))
+    make_button(btn_row, "Cancel", dlg.destroy).pack(side=tk.LEFT)
+
+    dlg.update_idletasks()
+    dlg.geometry(f"{dlg.winfo_reqwidth()}x{dlg.winfo_reqheight()}")
 
 
 def clear_all_data():
@@ -2732,9 +2987,6 @@ def clear_all_data():
         "All games and arsenal balls have been removed.\n\n"
         "You have a clean slate — add a game or import a scoresheet to begin.",
     )
-
-
-
 # ---------- SHUTDOWN ----------
 
 def on_close():
