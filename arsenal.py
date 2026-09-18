@@ -10,6 +10,7 @@ import csv
 import json
 import os
 import sys
+from typing import Any, Optional, List, Dict 
 import tkinter as tk
 from tkinter import messagebox, ttk
 from datetime import datetime
@@ -141,8 +142,7 @@ def _search_approved_balls(cursor, query, limit=200):
     )
     return cursor.fetchall()
 
-
-def _parse_frames(frame_data):
+def _parse_frames(frame_data: Optional[str]) -> Optional[List[Dict[str, Any]]]:
     if not frame_data:
         return None
     try:
@@ -150,28 +150,28 @@ def _parse_frames(frame_data):
     except (TypeError, json.JSONDecodeError):
         return None
 
-
 def _names_match(a, b):
     if not a or not b:
         return False
     return str(a).strip().lower() == str(b).strip().lower()
 
-
-def _first_ball_pins(mark):
+def _first_ball_pins(mark: Any) -> Optional[int]:
     if mark is None:
         return None
-    m = str(mark).strip().upper()
+    m: str = str(mark).strip().upper()
     if m == "X":
         return 10
     if m in ("-", ""):
         return 0
     try:
-        v = int(m)
+        v: int = int(m)
         if 0 <= v <= 9:
             return v
     except (TypeError, ValueError):
         pass
     return None
+
+
 
 
 def _count_frame_roles(frames):
